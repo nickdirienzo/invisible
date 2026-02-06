@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import type { App } from "./ir/index.js";
@@ -7,10 +7,11 @@ import { compileToCompose } from "./compilers/compose.js";
 import { compileToDockerfile } from "./compilers/dockerfile.js";
 import { compileToK8s } from "./compilers/k8s.js";
 
-const PLAN_FILE = "ii.plan.json";
+const II_DIR = ".ii";
+const PLAN_FILE = "plan.json";
 
 const USAGE = `Usage:
-  ii plan                        <project-dir>   Analyze source, write ${PLAN_FILE}
+  ii plan                        <project-dir>   Analyze source, write .ii/${PLAN_FILE}
   ii deploy --local              <project-dir>   Deploy locally via Docker
   ii deploy --k8s                <project-dir>   Compile to k8s manifests
   ii deploy --local --plan FILE  <project-dir>   Deploy using an existing plan file
@@ -43,6 +44,12 @@ function parseDeployArgs(args: string[]): DeployOpts {
   return { target, planFile, projectDir: resolve(projectDir) };
 }
 
+function iiDir(projectDir: string): string {
+  const dir = join(projectDir, II_DIR);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 function main() {
   const args = process.argv.slice(2);
   const command = args[0];
@@ -70,8 +77,9 @@ function main() {
 
 function doPlan(projectDir: string) {
   const app = plan(projectDir);
+  const out = iiDir(projectDir);
 
-  writeFileSync(join(projectDir, PLAN_FILE), JSON.stringify(app, null, 2) + "\n");
+  writeFileSync(join(out, PLAN_FILE), JSON.stringify(app, null, 2) + "\n");
 
   console.log(`${app.name}: ${app.services.length} service(s)\n`);
   for (const svc of app.services) {
@@ -79,7 +87,7 @@ function doPlan(projectDir: string) {
     console.log(`    port:    ${svc.port}`);
     console.log(`    ingress: ${svc.ingress ? "yes" : "no"}`);
   }
-  console.log(`\nPlan written to ${PLAN_FILE}`);
+  console.log(`\nPlan written to ${II_DIR}/${PLAN_FILE}`);
 }
 
 function loadOrPlan(projectDir: string, planFile: string | null): App {
@@ -88,7 +96,8 @@ function loadOrPlan(projectDir: string, planFile: string | null): App {
   }
 
   const app = plan(projectDir);
-  writeFileSync(join(projectDir, PLAN_FILE), JSON.stringify(app, null, 2) + "\n");
+  const out = iiDir(projectDir);
+  writeFileSync(join(out, PLAN_FILE), JSON.stringify(app, null, 2) + "\n");
   return app;
 }
 
@@ -96,13 +105,14 @@ function doDeployLocal({ projectDir, planFile }: DeployOpts) {
   const app = loadOrPlan(projectDir, planFile);
   const startCmd = getStartCmd(projectDir);
   const svc = app.services[0];
+  const out = iiDir(projectDir);
 
-  writeFileSync(join(projectDir, "Dockerfile"), compileToDockerfile(svc, startCmd));
-  writeFileSync(join(projectDir, "docker-compose.yml"), compileToCompose(app));
+  writeFileSync(join(out, "Dockerfile"), compileToDockerfile(svc, startCmd));
+  writeFileSync(join(out, "docker-compose.yml"), compileToCompose(app));
 
   console.log(`${app.name}: deploying ${app.services.length} service(s) locally...\n`);
 
-  execSync("docker compose up --build", {
+  execSync(`docker compose -f ${II_DIR}/docker-compose.yml up --build`, {
     cwd: projectDir,
     stdio: "inherit",
   });
@@ -112,13 +122,14 @@ function doDeployK8s({ projectDir, planFile }: DeployOpts) {
   const app = loadOrPlan(projectDir, planFile);
   const startCmd = getStartCmd(projectDir);
   const svc = app.services[0];
+  const out = iiDir(projectDir);
 
-  writeFileSync(join(projectDir, "Dockerfile"), compileToDockerfile(svc, startCmd));
-  writeFileSync(join(projectDir, "k8s.yml"), compileToK8s(app));
+  writeFileSync(join(out, "Dockerfile"), compileToDockerfile(svc, startCmd));
+  writeFileSync(join(out, "k8s.yml"), compileToK8s(app));
 
   console.log(`${app.name}: compiled ${app.services.length} service(s)\n`);
-  console.log(`  Dockerfile`);
-  console.log(`  k8s.yml`);
+  console.log(`  ${II_DIR}/Dockerfile`);
+  console.log(`  ${II_DIR}/k8s.yml`);
 }
 
 function getStartCmd(projectDir: string): string {
