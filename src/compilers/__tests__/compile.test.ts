@@ -325,3 +325,160 @@ describe("compileToK8s with secrets", () => {
     expect(valkeyDeploy).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Cron job resources (Dapr)
+// ---------------------------------------------------------------------------
+
+const cronApp: App = {
+  name: "cron-app",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "index.ts",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+    },
+  ],
+  resources: [
+    {
+      kind: "cron-job",
+      name: "daily-report",
+      endpoint: "/job/daily-report",
+      method: "POST",
+      intervalMs: 86400000,
+      sourceFile: "index.ts",
+    },
+  ],
+};
+
+describe("compileToCompose with cron jobs", () => {
+  it("adds Dapr sidecar service", () => {
+    const doc = parse(compileToCompose(cronApp));
+    expect(doc.services["web-dapr"]).toBeDefined();
+    expect(doc.services["web-dapr"].image).toBe("daprio/daprd:latest");
+    expect(doc.services["web-dapr"].network_mode).toBe("service:web");
+  });
+
+  it("adds Dapr scheduler and placement services", () => {
+    const doc = parse(compileToCompose(cronApp));
+    expect(doc.services["dapr-scheduler"]).toBeDefined();
+    expect(doc.services["dapr-scheduler"].image).toBe("daprio/dapr:latest");
+    expect(doc.services["dapr-placement"]).toBeDefined();
+    expect(doc.services["dapr-placement"].image).toBe("daprio/dapr:latest");
+  });
+
+  it("does not inject DAPR_CRON_JOBS env var (reconciliation at deploy time)", () => {
+    const doc = parse(compileToCompose(cronApp));
+    expect(doc.services.web.environment?.DAPR_CRON_JOBS).toBeUndefined();
+  });
+
+  it("exposes Dapr HTTP port for CLI reconciliation", () => {
+    const doc = parse(compileToCompose(cronApp));
+    expect(doc.services.web.ports).toContain("3500:3500");
+  });
+
+  it("Dapr sidecar depends on app and scheduler", () => {
+    const doc = parse(compileToCompose(cronApp));
+    expect(doc.services["web-dapr"].depends_on).toContain("web");
+    expect(doc.services["web-dapr"].depends_on).toContain("dapr-scheduler");
+  });
+
+  it("Dapr sidecar mounts components dir and state volume", () => {
+    const doc = parse(compileToCompose(cronApp));
+    expect(doc.services["web-dapr"].volumes).toContain("./.ii/components:/components");
+    expect(doc.services["web-dapr"].volumes).toContain("dapr-state:/state");
+  });
+
+  it("Dapr sidecar has -resources-path flag", () => {
+    const doc = parse(compileToCompose(cronApp));
+    const cmd = doc.services["web-dapr"].command;
+    expect(cmd).toContain("-resources-path");
+    expect(cmd).toContain("/components");
+  });
+
+  it("declares dapr-state named volume", () => {
+    const doc = parse(compileToCompose(cronApp));
+    expect(doc.volumes).toBeDefined();
+    expect(doc.volumes["dapr-state"]).toBeDefined();
+  });
+});
+
+describe("compileToK8s with cron jobs", () => {
+  it("adds Dapr annotations to Deployment pod template", () => {
+    const docs = compileToK8s(cronApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const webDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "web"
+    );
+    const annotations = webDeploy.spec.template.metadata.annotations;
+    expect(annotations["dapr.io/enabled"]).toBe("true");
+    expect(annotations["dapr.io/app-id"]).toBe("web");
+    expect(annotations["dapr.io/app-port"]).toBe("3000");
+  });
+
+  it("does not inject DAPR_CRON_JOBS env var (reconciliation at deploy time)", () => {
+    const docs = compileToK8s(cronApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const webDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "web"
+    );
+    const env = webDeploy.spec.template.spec.containers[0].env;
+    expect(env).toBeUndefined();
+  });
+
+  it("does not add separate Dapr Deployment", () => {
+    const docs = compileToK8s(cronApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const daprDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "dapr-scheduler"
+    );
+    expect(daprDeploy).toBeUndefined();
+  });
+
+  it("includes Dapr state store Component for job reconciliation", () => {
+    const docs = compileToK8s(cronApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const stateStore = docs.find(
+      (d) => d.kind === "Component" && d.metadata.name === "ii-state"
+    );
+    expect(stateStore).toBeDefined();
+    expect(stateStore.spec.type).toBe("state.sqlite");
+  });
+});
+
+describe("compileToDockerfile with cron jobs", () => {
+  it("does not include --import for cron shim (reconciliation at deploy time)", () => {
+    const dockerfile = compileToDockerfile(cronApp.services[0], "node index.js", {
+      hasCronJobs: true,
+    });
+    expect(dockerfile).not.toContain("cron-shim.mjs");
+  });
+
+  it("copies cron-jobs.json in build stage for transformer", () => {
+    const dockerfile = compileToDockerfile(cronApp.services[0], "node index.js", {
+      hasCronJobs: true,
+    });
+    expect(dockerfile).toContain("cron-jobs.json");
+    expect(dockerfile).toContain("build.mjs");
+  });
+
+  it("includes secrets shim import but not cron shim", () => {
+    const dockerfile = compileToDockerfile(cronApp.services[0], "node index.js", {
+      hasSecrets: true,
+      hasCronJobs: true,
+    });
+    expect(dockerfile).toContain("secrets-shim.mjs");
+    expect(dockerfile).not.toContain("cron-shim.mjs");
+  });
+});

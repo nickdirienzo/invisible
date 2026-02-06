@@ -5,6 +5,8 @@ export interface DockerfileOptions {
   hasResources?: boolean;
   /** When true, copies secrets shim and uses --import to load it before app */
   hasSecrets?: boolean;
+  /** When true, copies cron shim and uses --import to load it before app */
+  hasCronJobs?: boolean;
 }
 
 export function compileToDockerfile(
@@ -14,6 +16,7 @@ export function compileToDockerfile(
 ): string {
   const hasResources = !!options?.hasResources;
   const hasSecrets = !!options?.hasSecrets;
+  const hasCronJobs = !!options?.hasCronJobs;
 
   // Framework apps (Remix, Next, etc.) — use the framework's own build & start
   if (svc.startCmd && svc.buildCmd) {
@@ -31,10 +34,16 @@ CMD ["npm", "run", "start"]
 
   if (svc.typescript) {
     const jsEntry = svc.entrypoint.replace(/\.ts$/, ".js").replace(/\.mts$/, ".mjs");
-    const buildCmd = hasResources
-      ? `COPY .ii/build.mjs ./.ii/build.mjs
-COPY .ii/resources.json ./.ii/resources.json
-RUN node .ii/build.mjs`
+    const needsCustomBuild = hasResources || hasCronJobs;
+    const buildCopyParts: string[] = [];
+    if (needsCustomBuild) {
+      buildCopyParts.push("COPY .ii/build.mjs ./.ii/build.mjs");
+      if (hasResources) buildCopyParts.push("COPY .ii/resources.json ./.ii/resources.json");
+      if (hasCronJobs) buildCopyParts.push("COPY .ii/cron-jobs.json ./.ii/cron-jobs.json");
+      buildCopyParts.push("RUN node .ii/build.mjs");
+    }
+    const buildCmd = needsCustomBuild
+      ? buildCopyParts.join("\n")
       : "RUN npx tsc --outDir dist";
 
     const runtimeParts: string[] = [];
@@ -48,8 +57,13 @@ RUN node .ii/build.mjs`
       ? runtimeParts.join("\n") + "\n"
       : "";
 
-    const cmd = hasSecrets
-      ? `CMD ["node", "--import", "./.ii/runtime/secrets-shim.mjs", "dist/${jsEntry}"]`
+    // Cron job registration is handled by the CLI at deploy time,
+    // not at app startup — no --import for cron shim.
+    const importFlags: string[] = [];
+    if (hasSecrets) importFlags.push("--import", "./.ii/runtime/secrets-shim.mjs");
+
+    const cmd = importFlags.length > 0
+      ? `CMD ["node", ${importFlags.map((f) => `"${f}"`).join(", ")}, "dist/${jsEntry}"]`
       : `CMD ["node", "dist/${jsEntry}"]`;
 
     return `FROM node:22-slim AS build

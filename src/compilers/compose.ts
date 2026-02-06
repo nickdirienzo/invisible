@@ -12,10 +12,14 @@ interface ComposeService {
   ports?: string[];
   environment?: Record<string, string>;
   depends_on?: string[];
+  command?: string[];
+  network_mode?: string;
+  volumes?: string[];
 }
 
 interface ComposeFile {
   services: Record<string, ComposeService>;
+  volumes?: Record<string, Record<string, never>>;
 }
 
 function hasDurableMaps(app: App): boolean {
@@ -24,6 +28,10 @@ function hasDurableMaps(app: App): boolean {
 
 function hasSecrets(app: App): boolean {
   return app.resources?.some((r) => r.kind === "secret") ?? false;
+}
+
+function hasCronJobs(app: App): boolean {
+  return app.resources?.some((r) => r.kind === "cron-job") ?? false;
 }
 
 function getSecretNames(app: App): string[] {
@@ -38,6 +46,7 @@ export function compileToCompose(app: App): string {
   const compose: ComposeFile = { services: {} };
   const hasMaps = hasDurableMaps(app);
   const hasSecretResources = hasSecrets(app);
+  const hasCron = hasCronJobs(app);
 
   for (const svc of app.services) {
     const composeSvc: ComposeService = {
@@ -47,8 +56,17 @@ export function compileToCompose(app: App): string {
       },
     };
 
+    const ports: string[] = [];
     if (svc.ingress?.length) {
-      composeSvc.ports = [`${svc.port}:${svc.port}`];
+      ports.push(`${svc.port}:${svc.port}`);
+    }
+    // Expose Dapr HTTP port so the CLI can reconcile jobs at deploy time.
+    // The sidecar uses network_mode: service:<app>, so its ports are on the app's network.
+    if (hasCron) {
+      ports.push("3500:3500");
+    }
+    if (ports.length > 0) {
+      composeSvc.ports = ports;
     }
 
     const env: Record<string, string> = { ...(svc.env ?? {}) };
@@ -60,6 +78,8 @@ export function compileToCompose(app: App): string {
       env.OPENBAO_TOKEN = "dev-root-token";
       env.OPENBAO_SECRETS = JSON.stringify(getSecretNames(app));
     }
+    // Note: cron job registration is handled by the CLI at deploy time,
+    // not by the app at startup. No DAPR_CRON_JOBS env var needed.
     if (Object.keys(env).length > 0) {
       composeSvc.environment = env;
     }
@@ -72,6 +92,26 @@ export function compileToCompose(app: App): string {
     }
 
     compose.services[svc.name] = composeSvc;
+
+    if (hasCron) {
+      compose.services[`${svc.name}-dapr`] = {
+        image: "daprio/daprd:latest",
+        command: [
+          "./daprd",
+          "-app-id", svc.name,
+          "-app-port", String(svc.port),
+          "-dapr-http-port", "3500",
+          "-scheduler-host-address", "dapr-scheduler:50006",
+          "-resources-path", "/components",
+        ],
+        network_mode: `service:${svc.name}`,
+        depends_on: [svc.name, "dapr-scheduler"],
+        volumes: [
+          "./.ii/components:/components",
+          "dapr-state:/state",
+        ],
+      };
+    }
   }
 
   if (hasMaps) {
@@ -90,6 +130,21 @@ export function compileToCompose(app: App): string {
         BAO_DEV_LISTEN_ADDRESS: "0.0.0.0:8200",
       },
     };
+  }
+
+  if (hasCron) {
+    compose.services["dapr-scheduler"] = {
+      image: "daprio/dapr:latest",
+      command: ["./scheduler", "--port", "50006", "--etcd-data-dir", "/var/lock/dapr/scheduler"],
+    };
+    compose.services["dapr-placement"] = {
+      image: "daprio/dapr:latest",
+      command: ["./placement", "--port", "50005"],
+    };
+  }
+
+  if (hasCron) {
+    compose.volumes = { "dapr-state": {} };
   }
 
   return stringify(compose);

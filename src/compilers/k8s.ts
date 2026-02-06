@@ -16,6 +16,10 @@ function hasSecrets(app: App): boolean {
   return app.resources?.some((r) => r.kind === "secret") ?? false;
 }
 
+function hasCronJobs(app: App): boolean {
+  return app.resources?.some((r) => r.kind === "cron-job") ?? false;
+}
+
 function getSecretNames(app: App): string[] {
   return [...new Set(
     (app.resources ?? [])
@@ -24,7 +28,7 @@ function getSecretNames(app: App): string[] {
   )];
 }
 
-function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResources: boolean): K8sManifest {
+function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResources: boolean, hasCron: boolean): K8sManifest {
   const labels = { app: svc.name };
   const replicas = svc.scale?.min ?? 1;
 
@@ -40,8 +44,19 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
     envEntries.push({ name: "OPENBAO_TOKEN", value: "dev-root-token" });
     envEntries.push({ name: "OPENBAO_SECRETS", value: JSON.stringify(getSecretNames(app)) });
   }
+  // Note: cron job registration is handled by the CLI at deploy time,
+  // not by the app at startup. No DAPR_CRON_JOBS env var needed.
 
   const env = envEntries.length > 0 ? envEntries : undefined;
+
+  const templateMetadata: Record<string, unknown> = { labels };
+  if (hasCron) {
+    templateMetadata.annotations = {
+      "dapr.io/enabled": "true",
+      "dapr.io/app-id": svc.name,
+      "dapr.io/app-port": String(svc.port),
+    };
+  }
 
   return {
     apiVersion: "apps/v1",
@@ -51,7 +66,7 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
       replicas,
       selector: { matchLabels: labels },
       template: {
-        metadata: { labels },
+        metadata: templateMetadata,
         spec: {
           containers: [
             {
@@ -186,13 +201,29 @@ function makeOpenBaoService(): K8sManifest {
   };
 }
 
+function makeDaprStateStoreComponent(): K8sManifest {
+  return {
+    apiVersion: "dapr.io/v1alpha1",
+    kind: "Component",
+    metadata: { name: "ii-state" },
+    spec: {
+      type: "state.sqlite",
+      version: "v1",
+      metadata: [
+        { name: "connectionString", value: "/state/ii-state.db" },
+      ],
+    },
+  };
+}
+
 export function compileToK8s(app: App): string {
   const manifests: K8sManifest[] = [];
   const hasMaps = hasDurableMaps(app);
   const hasSecretResources = hasSecrets(app);
+  const hasCron = hasCronJobs(app);
 
   for (const svc of app.services) {
-    manifests.push(makeDeployment(app, svc, hasMaps, hasSecretResources));
+    manifests.push(makeDeployment(app, svc, hasMaps, hasSecretResources, hasCron));
     manifests.push(makeService(svc));
 
     if (svc.ingress?.length) {
@@ -208,6 +239,10 @@ export function compileToK8s(app: App): string {
   if (hasSecretResources) {
     manifests.push(makeOpenBaoDeployment());
     manifests.push(makeOpenBaoService());
+  }
+
+  if (hasCron) {
+    manifests.push(makeDaprStateStoreComponent());
   }
 
   return manifests.map((m) => stringify(m)).join("---\n");
