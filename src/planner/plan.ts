@@ -1,5 +1,7 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { readdirSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join, basename } from "node:path";
+import ts from "typescript";
 import type { App } from "../ir/index.js";
 
 interface PackageJson {
@@ -11,11 +13,11 @@ interface PackageJson {
 export function plan(projectDir: string): App {
   const pkg = readPackageJson(projectDir);
   const appName = pkg.name ?? basename(projectDir);
-  const sources = readSourceFiles(projectDir);
+  const sourceFiles = findSourceFiles(projectDir);
 
-  const port = detectHttpServer(sources);
-  const hasIngress = port !== null;
-  const entrypoint = detectEntrypoint(sources);
+  const listenResult = detectListenCall(projectDir, sourceFiles);
+  const hasIngress = listenResult !== null;
+  const entrypoint = listenResult?.file ?? detectEntrypoint(sourceFiles);
   const typescript = entrypoint.endsWith(".ts") || entrypoint.endsWith(".mts");
 
   return {
@@ -24,7 +26,7 @@ export function plan(projectDir: string): App {
       {
         name: "web",
         build: "./",
-        port: port ?? 3000,
+        port: listenResult?.port ?? 3000,
         entrypoint,
         typescript,
         ...(hasIngress ? { ingress: [{ host: "", path: "/" }] } : {}),
@@ -38,64 +40,217 @@ function readPackageJson(dir: string): PackageJson {
   return JSON.parse(raw) as PackageJson;
 }
 
-function readSourceFiles(dir: string): Map<string, string> {
-  const sources = new Map<string, string>();
-  const entries = readdirSync(dir, { withFileTypes: true });
+function findSourceFiles(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true })
+    .filter((e) => !e.isDirectory() && /\.(ts|js|mjs|mts)$/.test(e.name))
+    .map((e) => e.name);
+}
 
-  for (const entry of entries) {
-    if (entry.isDirectory()) continue;
-    if (!/\.(ts|js|mjs|mts)$/.test(entry.name)) continue;
+function detectEntrypoint(files: string[]): string {
+  if (files.includes("index.ts")) return "index.ts";
+  if (files.includes("index.js")) return "index.js";
+  return files[0] ?? "index.js";
+}
 
-    const content = readFileSync(join(dir, entry.name), "utf-8");
-    sources.set(entry.name, content);
-  }
-
-  return sources;
+interface ListenResult {
+  file: string;
+  port: number;
 }
 
 /**
- * Detects an HTTP server by looking for the stdlib contract:
+ * Uses the TypeScript type checker to find .listen() calls on objects
+ * whose type traces back to node:http, node:net, or known HTTP frameworks.
  *
- *   - server.listen(port)     — the universal signal, used by node:http,
- *                                Express, Fastify, Koa, etc.
- *   - createServer(...)       — explicit node:http usage
- *
- * Returns the port number if found, null otherwise.
+ * This avoids false positives from unrelated .listen() methods — only
+ * matches when the type system confirms it's a server.
  */
-function detectEntrypoint(sources: Map<string, string>): string {
-  // The file containing .listen() is the entrypoint
-  for (const [filename, content] of sources) {
-    if (content.match(/\.listen\(/)) return filename;
+function detectListenCall(
+  projectDir: string,
+  files: string[]
+): ListenResult | null {
+  const filePaths = files.map((f) => join(projectDir, f));
+
+  const program = ts.createProgram(filePaths, {
+    target: ts.ScriptTarget.Latest,
+    module: ts.ModuleKind.Node16,
+    moduleResolution: ts.ModuleResolutionKind.Node16,
+    esModuleInterop: true,
+    skipLibCheck: true,
+    noEmit: true,
+    // Resolve types from node_modules
+    baseUrl: projectDir,
+  });
+
+  const checker = program.getTypeChecker();
+
+  for (const file of files) {
+    const sourceFile = program.getSourceFile(join(projectDir, file));
+    if (!sourceFile) continue;
+
+    const result = walkForListen(sourceFile, checker);
+    if (result !== null) {
+      return { file, port: result };
+    }
   }
 
-  // Fallback: prefer index.ts > index.js
-  if (sources.has("index.ts")) return "index.ts";
-  if (sources.has("index.js")) return "index.js";
-
-  // First source file found
-  const first = sources.keys().next().value;
-  return first ?? "index.js";
+  return null;
 }
 
-function detectHttpServer(sources: Map<string, string>): number | null {
-  for (const [, content] of sources) {
-    // Look for .listen(arg) — this is the stdlib primitive.
-    // Every HTTP framework in Node calls this under the hood.
-    const listenMatch = content.match(/\.listen\(\s*(\w+)/);
-    if (!listenMatch) continue;
+/**
+ * Known type names that indicate an HTTP server.
+ * These are the types that have a meaningful .listen() method
+ * for binding to a network port.
+ */
+const HTTP_SERVER_TYPES = new Set([
+  "Server",       // node:http, node:https, node:net
+  "Application",  // Express
+  "Express",      // Express (alternate type name)
+  "FastifyInstance",
+  "Koa",
+]);
 
-    const arg = listenMatch[1];
+function isHttpServerType(type: ts.Type, checker: ts.TypeChecker): boolean {
+  const typeName = checker.typeToString(type);
 
-    // Direct numeric literal: .listen(3000)
-    const numeric = parseInt(arg, 10);
-    if (!isNaN(numeric)) return numeric;
+  // If types aren't resolvable (e.g. missing node_modules), the checker
+  // returns "any" or "error". Accept those — better a false positive from
+  // an unresolved type than silently missing a real server.
+  if (type.flags & ts.TypeFlags.Any) return true;
 
-    // Variable reference: const port = process.env.PORT || 3000
-    const varPattern = new RegExp(
-      `(?:const|let|var)\\s+${arg}\\s*=\\s*(?:.*\\|\\|\\s*)?(\\d+)`
-    );
-    const varMatch = content.match(varPattern);
-    if (varMatch) return parseInt(varMatch[1], 10);
+  // Check the type name directly. Strip generic parameters
+  // (e.g. "Server<typeof IncomingMessage, typeof ServerResponse>" → "Server")
+  const baseName = typeName.split("<")[0];
+  if (HTTP_SERVER_TYPES.has(baseName)) return true;
+
+  // Check if any base type / constituent type matches
+  // This handles Express which returns http.Server from .listen()
+  if (type.isUnionOrIntersection()) {
+    return type.types.some((t) => isHttpServerType(t, checker));
+  }
+
+  // Check the return type of .listen — if the object has a .listen
+  // that returns Server, it's likely an HTTP server
+  const listenProp = type.getProperty("listen");
+  if (listenProp) {
+    const listenType = checker.getTypeOfSymbol(listenProp);
+    const signatures = listenType.getCallSignatures();
+    for (const sig of signatures) {
+      const returnType = checker.getReturnTypeOfSignature(sig);
+      const returnName = checker.typeToString(returnType);
+      if (returnName === "Server" || returnName === "this") return true;
+    }
+  }
+
+  return false;
+}
+
+function walkForListen(
+  sourceFile: ts.SourceFile,
+  checker: ts.TypeChecker
+): number | null {
+  let result: number | null = null;
+
+  function visit(node: ts.Node) {
+    if (result !== null) return;
+
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === "listen" &&
+      node.arguments.length > 0
+    ) {
+      // Get the type of the object .listen() is called on
+      const objType = checker.getTypeAtLocation(node.expression.expression);
+
+      if (isHttpServerType(objType, checker)) {
+        const port = resolvePort(node.arguments[0], sourceFile);
+        if (port !== null) {
+          result = port;
+          return;
+        }
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return result;
+}
+
+/**
+ * Resolve the port value from a .listen() argument.
+ * Handles:
+ *   - Numeric literals: .listen(3000)
+ *   - Variable references: .listen(port) → follows to declaration
+ *   - Object literals: .listen({ port: 3000 })
+ */
+function resolvePort(
+  arg: ts.Expression,
+  sourceFile: ts.SourceFile
+): number | null {
+  if (ts.isNumericLiteral(arg)) {
+    return parseInt(arg.text, 10);
+  }
+
+  if (ts.isObjectLiteralExpression(arg)) {
+    for (const prop of arg.properties) {
+      if (
+        ts.isPropertyAssignment(prop) &&
+        ts.isIdentifier(prop.name) &&
+        prop.name.text === "port"
+      ) {
+        return resolvePort(prop.initializer, sourceFile);
+      }
+    }
+    return null;
+  }
+
+  if (ts.isIdentifier(arg)) {
+    return resolveVariable(arg.text, sourceFile);
+  }
+
+  return null;
+}
+
+function resolveVariable(
+  name: string,
+  sourceFile: ts.SourceFile
+): number | null {
+  let result: number | null = null;
+
+  function visit(node: ts.Node) {
+    if (result !== null) return;
+
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === name &&
+      node.initializer
+    ) {
+      result = resolveExpression(node.initializer);
+      return;
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return result;
+}
+
+function resolveExpression(expr: ts.Expression): number | null {
+  if (ts.isNumericLiteral(expr)) {
+    return parseInt(expr.text, 10);
+  }
+
+  if (ts.isBinaryExpression(expr)) {
+    if (
+      expr.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+      expr.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken
+    ) {
+      return resolveExpression(expr.right);
+    }
   }
 
   return null;
