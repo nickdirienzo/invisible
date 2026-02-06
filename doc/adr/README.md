@@ -15,13 +15,14 @@ This directory contains the Architecture Decision Records (ADRs) for the Invisib
 - [ADR-0008](0008-openbao-for-secrets-management.md) — Use OpenBao for Least-Privilege Secrets Management
 - [ADR-0009](0009-compliance-by-default.md) — Provision Compliance Controls by Default
 - [ADR-0010](0010-open-source-planner-hosted-runtime-business-model.md) — Open Source Planner with Hosted Runtime Business Model
+- [ADR-0011](0011-kubernetes-for-compute-and-ingress.md) — Target Kubernetes for Compute and HTTP Ingress
 
 ## Creating New ADRs
 
 To add a new decision record:
 
 1. Copy the template from ADR-0000
-2. Number it sequentially (next: `0011`)
+2. Number it sequentially (next: `0012`)
 3. Use a descriptive filename: `NNNN-short-title-with-hyphens.md`
 4. Fill in Context (why), Decision (what), and Consequences (tradeoffs)
 5. Set status to `Proposed`, then update to `Accepted` after team review
