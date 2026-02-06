@@ -8,7 +8,23 @@ interface K8sManifest {
   spec: Record<string, unknown>;
 }
 
-function makeDeployment(app: App, svc: Service, hasResources: boolean): K8sManifest {
+function hasDurableMaps(app: App): boolean {
+  return app.resources?.some((r) => r.kind === "durable-map") ?? false;
+}
+
+function hasSecrets(app: App): boolean {
+  return app.resources?.some((r) => r.kind === "secret") ?? false;
+}
+
+function getSecretNames(app: App): string[] {
+  return [...new Set(
+    (app.resources ?? [])
+      .filter((r) => r.kind === "secret")
+      .map((r) => r.name)
+  )];
+}
+
+function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResources: boolean): K8sManifest {
   const labels = { app: svc.name };
   const replicas = svc.scale?.min ?? 1;
 
@@ -16,8 +32,13 @@ function makeDeployment(app: App, svc: Service, hasResources: boolean): K8sManif
     ? Object.entries(svc.env).map(([name, value]) => ({ name, value }))
     : [];
 
-  if (hasResources) {
+  if (hasMaps) {
     envEntries.push({ name: "VALKEY_URL", value: "valkey://valkey:6379" });
+  }
+  if (hasSecretResources) {
+    envEntries.push({ name: "OPENBAO_ADDR", value: "http://openbao:8200" });
+    envEntries.push({ name: "OPENBAO_TOKEN", value: "dev-root-token" });
+    envEntries.push({ name: "OPENBAO_SECRETS", value: JSON.stringify(getSecretNames(app)) });
   }
 
   const env = envEntries.length > 0 ? envEntries : undefined;
@@ -123,12 +144,55 @@ function makeValkeyService(): K8sManifest {
   };
 }
 
+function makeOpenBaoDeployment(): K8sManifest {
+  const labels = { app: "openbao" };
+  return {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: { name: "openbao", labels },
+    spec: {
+      replicas: 1,
+      selector: { matchLabels: labels },
+      template: {
+        metadata: { labels },
+        spec: {
+          containers: [
+            {
+              name: "openbao",
+              image: "quay.io/openbao/openbao:latest",
+              ports: [{ containerPort: 8200 }],
+              env: [
+                { name: "BAO_DEV_ROOT_TOKEN_ID", value: "dev-root-token" },
+                { name: "BAO_DEV_LISTEN_ADDRESS", value: "0.0.0.0:8200" },
+              ],
+              args: ["server", "-dev"],
+            },
+          ],
+        },
+      },
+    },
+  };
+}
+
+function makeOpenBaoService(): K8sManifest {
+  return {
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name: "openbao" },
+    spec: {
+      selector: { app: "openbao" },
+      ports: [{ port: 8200, targetPort: 8200 }],
+    },
+  };
+}
+
 export function compileToK8s(app: App): string {
   const manifests: K8sManifest[] = [];
-  const hasResources = (app.resources?.length ?? 0) > 0;
+  const hasMaps = hasDurableMaps(app);
+  const hasSecretResources = hasSecrets(app);
 
   for (const svc of app.services) {
-    manifests.push(makeDeployment(app, svc, hasResources));
+    manifests.push(makeDeployment(app, svc, hasMaps, hasSecretResources));
     manifests.push(makeService(svc));
 
     if (svc.ingress?.length) {
@@ -136,9 +200,14 @@ export function compileToK8s(app: App): string {
     }
   }
 
-  if (hasResources) {
+  if (hasMaps) {
     manifests.push(makeValkeyDeployment());
     manifests.push(makeValkeyService());
+  }
+
+  if (hasSecretResources) {
+    manifests.push(makeOpenBaoDeployment());
+    manifests.push(makeOpenBaoService());
   }
 
   return manifests.map((m) => stringify(m)).join("---\n");

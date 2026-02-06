@@ -3,6 +3,8 @@ import type { Service } from "../ir/index.js";
 export interface DockerfileOptions {
   /** When true, the build uses .ii/build.mjs instead of plain tsc */
   hasResources?: boolean;
+  /** When true, copies secrets shim and uses --import to load it before app */
+  hasSecrets?: boolean;
 }
 
 export function compileToDockerfile(
@@ -11,6 +13,7 @@ export function compileToDockerfile(
   options?: DockerfileOptions
 ): string {
   const hasResources = !!options?.hasResources;
+  const hasSecrets = !!options?.hasSecrets;
 
   if (svc.typescript) {
     const jsEntry = svc.entrypoint.replace(/\.ts$/, ".js").replace(/\.mts$/, ".mjs");
@@ -20,11 +23,20 @@ COPY .ii/resources.json ./.ii/resources.json
 RUN node .ii/build.mjs`
       : "RUN npx tsc --outDir dist";
 
-    const runtimeLines = hasResources
-      ? `COPY .ii/runtime ./.ii/runtime
-RUN npm install @valkey/valkey-glide
-`
+    const runtimeParts: string[] = [];
+    if (hasResources || hasSecrets) {
+      runtimeParts.push("COPY .ii/runtime ./.ii/runtime");
+    }
+    if (hasResources) {
+      runtimeParts.push("RUN npm install @valkey/valkey-glide");
+    }
+    const runtimeLines = runtimeParts.length > 0
+      ? runtimeParts.join("\n") + "\n"
       : "";
+
+    const cmd = hasSecrets
+      ? `CMD ["node", "--import", "./.ii/runtime/secrets-shim.mjs", "dist/${jsEntry}"]`
+      : `CMD ["node", "dist/${jsEntry}"]`;
 
     return `FROM node:22-slim AS build
 WORKDIR /app
@@ -39,7 +51,7 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 ${runtimeLines}EXPOSE ${svc.port}
-CMD ["node", "dist/${jsEntry}"]
+${cmd}
 `;
   }
 

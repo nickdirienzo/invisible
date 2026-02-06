@@ -149,3 +149,138 @@ describe("compileToK8s with resources", () => {
     expect(env).toContainEqual({ name: "VALKEY_URL", value: "valkey://valkey:6379" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Secret resources (OpenBao)
+// ---------------------------------------------------------------------------
+
+const secretApp: App = {
+  name: "secret-app",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "index.ts",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+    },
+  ],
+  resources: [
+    { kind: "secret", name: "STRIPE_API_KEY", sourceFile: "index.ts" },
+    { kind: "secret", name: "DATABASE_URL", sourceFile: "index.ts" },
+  ],
+};
+
+const mixedApp: App = {
+  name: "mixed-app",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "index.ts",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+    },
+  ],
+  resources: [
+    { kind: "durable-map", name: "counters", sourceFile: "index.ts" },
+    { kind: "secret", name: "API_KEY", sourceFile: "index.ts" },
+  ],
+};
+
+describe("compileToCompose with secrets", () => {
+  it("adds openbao service when secrets present", () => {
+    const doc = parse(compileToCompose(secretApp));
+    expect(doc.services.openbao).toBeDefined();
+    expect(doc.services.openbao.image).toBe("quay.io/openbao/openbao:latest");
+  });
+
+  it("injects OPENBAO_ADDR, OPENBAO_TOKEN, and OPENBAO_SECRETS into app service", () => {
+    const doc = parse(compileToCompose(secretApp));
+    expect(doc.services.web.environment.OPENBAO_ADDR).toBe("http://openbao:8200");
+    expect(doc.services.web.environment.OPENBAO_TOKEN).toBe("dev-root-token");
+    const secrets = JSON.parse(doc.services.web.environment.OPENBAO_SECRETS);
+    expect(secrets).toEqual(["STRIPE_API_KEY", "DATABASE_URL"]);
+  });
+
+  it("adds depends_on for openbao", () => {
+    const doc = parse(compileToCompose(secretApp));
+    expect(doc.services.web.depends_on).toContain("openbao");
+  });
+
+  it("does not add valkey when only secrets present", () => {
+    const doc = parse(compileToCompose(secretApp));
+    expect(doc.services.valkey).toBeUndefined();
+  });
+});
+
+describe("compileToCompose with mixed resources", () => {
+  it("adds both valkey and openbao services", () => {
+    const doc = parse(compileToCompose(mixedApp));
+    expect(doc.services.valkey).toBeDefined();
+    expect(doc.services.openbao).toBeDefined();
+  });
+
+  it("injects both VALKEY_URL and OPENBAO_ADDR", () => {
+    const doc = parse(compileToCompose(mixedApp));
+    expect(doc.services.web.environment.VALKEY_URL).toBe("valkey://valkey:6379");
+    expect(doc.services.web.environment.OPENBAO_ADDR).toBe("http://openbao:8200");
+  });
+
+  it("depends on both valkey and openbao", () => {
+    const doc = parse(compileToCompose(mixedApp));
+    expect(doc.services.web.depends_on).toContain("valkey");
+    expect(doc.services.web.depends_on).toContain("openbao");
+  });
+});
+
+describe("compileToK8s with secrets", () => {
+  it("adds OpenBao Deployment and Service", () => {
+    const docs = compileToK8s(secretApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const baoDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "openbao"
+    );
+    expect(baoDeploy).toBeDefined();
+    expect(baoDeploy.spec.template.spec.containers[0].image).toBe(
+      "quay.io/openbao/openbao:latest"
+    );
+
+    const baoSvc = docs.find(
+      (d) => d.kind === "Service" && d.metadata.name === "openbao"
+    );
+    expect(baoSvc).toBeDefined();
+    expect(baoSvc.spec.ports[0].port).toBe(8200);
+  });
+
+  it("injects OPENBAO_ADDR, OPENBAO_TOKEN, and OPENBAO_SECRETS into app containers", () => {
+    const docs = compileToK8s(secretApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const webDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "web"
+    );
+    const env = webDeploy.spec.template.spec.containers[0].env;
+    expect(env).toContainEqual({ name: "OPENBAO_ADDR", value: "http://openbao:8200" });
+    expect(env).toContainEqual({ name: "OPENBAO_TOKEN", value: "dev-root-token" });
+    const secretsEntry = env.find((e: { name: string }) => e.name === "OPENBAO_SECRETS");
+    expect(secretsEntry).toBeDefined();
+    expect(JSON.parse(secretsEntry.value)).toEqual(["STRIPE_API_KEY", "DATABASE_URL"]);
+  });
+
+  it("does not add Valkey when only secrets present", () => {
+    const docs = compileToK8s(secretApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const valkeyDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "valkey"
+    );
+    expect(valkeyDeploy).toBeUndefined();
+  });
+});
