@@ -13,6 +13,10 @@ export interface Service {
   ingress?: IngressRule[];
   scale?: ScaleBounds;
   env?: Record<string, string>;
+  /** When set, the service uses a framework CLI (e.g. remix-serve) instead of node dist/entry.js */
+  startCmd?: string;
+  /** When set, the build uses this command instead of tsc (e.g. "remix vite:build") */
+  buildCmd?: string;
 }
 
 export interface IngressRule {

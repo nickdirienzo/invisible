@@ -15,6 +15,20 @@ export function compileToDockerfile(
   const hasResources = !!options?.hasResources;
   const hasSecrets = !!options?.hasSecrets;
 
+  // Framework apps (Remix, Next, etc.) — use the framework's own build & start
+  if (svc.startCmd && svc.buildCmd) {
+    return `FROM node:22-slim
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm ci
+COPY . .
+RUN npm run build
+RUN npm prune --omit=dev
+EXPOSE ${svc.port}
+CMD ["npm", "run", "start"]
+`;
+  }
+
   if (svc.typescript) {
     const jsEntry = svc.entrypoint.replace(/\.ts$/, ".js").replace(/\.mts$/, ".mjs");
     const buildCmd = hasResources

@@ -128,3 +128,89 @@ describe("detectListenCall", () => {
     expect(result.services[0].entrypoint).toBe("server.ts");
   });
 });
+
+describe("detectFrameworkStart", () => {
+  it("detects framework from scripts.start", () => {
+    const dir = makeProject({
+      "package.json": JSON.stringify({
+        name: "remix-app",
+        scripts: {
+          build: "remix vite:build",
+          start: "remix-serve ./build/server/index.js",
+        },
+      }),
+      "vite.config.ts": `export default {};`,
+    });
+    const result = plan(dir);
+    expect(result.services[0].port).toBe(3000);
+    expect(result.services[0].ingress).toEqual([{ host: "", path: "/" }]);
+    expect(result.services[0].startCmd).toBe("remix-serve ./build/server/index.js");
+    expect(result.services[0].buildCmd).toBe("remix vite:build");
+  });
+
+  it("does not detect framework when scripts.build is missing", () => {
+    const dir = makeProject({
+      "package.json": JSON.stringify({
+        name: "no-build",
+        scripts: {
+          start: "remix-serve ./build/server/index.js",
+        },
+      }),
+      "index.ts": `console.log("hello");`,
+    });
+    const result = plan(dir);
+    expect(result.services[0].startCmd).toBeUndefined();
+    expect(result.services[0].ingress).toBeUndefined();
+  });
+
+  it("extracts port from --port flag", () => {
+    const dir = makeProject({
+      "package.json": JSON.stringify({
+        name: "custom-port-app",
+        scripts: {
+          build: "next build",
+          start: "next start --port 4000",
+        },
+      }),
+      "index.ts": `export default {};`,
+    });
+    const result = plan(dir);
+    expect(result.services[0].port).toBe(4000);
+  });
+
+  it("does not detect framework when scripts.start is missing", () => {
+    const dir = makeProject({
+      "package.json": JSON.stringify({
+        name: "no-start",
+        scripts: {
+          build: "tsc",
+        },
+      }),
+      "index.ts": `console.log("hello");`,
+    });
+    const result = plan(dir);
+    expect(result.services[0].startCmd).toBeUndefined();
+    expect(result.services[0].ingress).toBeUndefined();
+  });
+
+  it("prefers .listen() over framework detection", () => {
+    const dir = makeProject({
+      "package.json": JSON.stringify({
+        name: "custom-server",
+        scripts: {
+          build: "remix vite:build",
+          start: "remix-serve ./build/server/index.js",
+        },
+      }),
+      "server.ts": `
+        import express from "express";
+        const app = express();
+        app.listen(4000);
+      `,
+    });
+    const result = plan(dir);
+    expect(result.services[0].port).toBe(4000);
+    expect(result.services[0].entrypoint).toBe("server.ts");
+    expect(result.services[0].startCmd).toBeUndefined();
+  });
+});

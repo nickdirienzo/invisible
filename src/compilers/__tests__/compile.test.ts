@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { parse } from "yaml";
 import type { App } from "../../ir/index.js";
 import { compileToCompose } from "../compose.js";
+import { compileToDockerfile } from "../dockerfile.js";
 import { compileToK8s } from "../k8s.js";
 
 const helloWorld: App = {
@@ -233,6 +234,46 @@ describe("compileToCompose with mixed resources", () => {
     const doc = parse(compileToCompose(mixedApp));
     expect(doc.services.web.depends_on).toContain("valkey");
     expect(doc.services.web.depends_on).toContain("openbao");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Framework Dockerfile compilation
+// ---------------------------------------------------------------------------
+
+const remixApp: App = {
+  name: "remix-app",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "app/root.tsx",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+      startCmd: "remix-serve ./build/server/index.js",
+      buildCmd: "remix vite:build",
+    },
+  ],
+};
+
+describe("compileToDockerfile with framework app", () => {
+  it("uses npm run build and framework start command", () => {
+    const dockerfile = compileToDockerfile(remixApp.services[0], "");
+    expect(dockerfile).toContain("RUN npm run build");
+    expect(dockerfile).toContain('CMD ["npm", "run", "start"]');
+    expect(dockerfile).toContain("EXPOSE 3000");
+  });
+
+  it("prunes dev deps after build", () => {
+    const dockerfile = compileToDockerfile(remixApp.services[0], "");
+    expect(dockerfile).toContain("RUN npm prune --omit=dev");
+  });
+
+  it("does not use tsc or multi-stage build", () => {
+    const dockerfile = compileToDockerfile(remixApp.services[0], "");
+    expect(dockerfile).not.toContain("tsc");
+    expect(dockerfile).not.toContain("AS build");
   });
 });
 
