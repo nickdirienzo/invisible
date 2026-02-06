@@ -26,6 +26,7 @@ export function plan(projectDir: string): App {
 
   const durableMaps = detectDurableMaps(program, projectDir, sourceFiles);
   const secrets = detectSecrets(program, projectDir, sourceFiles);
+  const cronJobs = detectCronJobs(program, projectDir, sourceFiles);
   const resources: Resource[] = [
     ...durableMaps.map((m) => ({
       kind: "durable-map" as const,
@@ -36,6 +37,14 @@ export function plan(projectDir: string): App {
       kind: "secret" as const,
       name: s.name,
       sourceFile: s.file,
+    })),
+    ...cronJobs.map((c) => ({
+      kind: "cron-job" as const,
+      name: c.name,
+      endpoint: c.endpoint,
+      method: c.method,
+      intervalMs: c.intervalMs,
+      sourceFile: c.file,
     })),
   ];
 
@@ -456,4 +465,188 @@ function walkForProcessEnv(
   }
 
   visit(sourceFile);
+}
+
+// ---------------------------------------------------------------------------
+// Cron job detection — module-scope setInterval(() => fetch('/...'), ms)
+// ---------------------------------------------------------------------------
+
+interface CronJobDetection {
+  name: string;
+  endpoint: string;
+  method: string;
+  intervalMs: number;
+  file: string;
+}
+
+/**
+ * Walk top-level statements looking for `setInterval(() => fetch('/job/...'), ms)`.
+ * Only module-scope calls are eligible for durable scheduling.
+ * The callback must be a single fetch() call to a /job/* route — Dapr triggers
+ * jobs by POSTing to /job/<name>, so the developer's handler and the Dapr
+ * callback share the same path. No shim or proxy needed.
+ */
+function detectCronJobs(
+  program: ts.Program,
+  projectDir: string,
+  files: string[]
+): CronJobDetection[] {
+  const results: CronJobDetection[] = [];
+
+  for (const file of files) {
+    const sourceFile = program.getSourceFile(join(projectDir, file));
+    if (!sourceFile) continue;
+
+    for (const statement of sourceFile.statements) {
+      if (!ts.isExpressionStatement(statement)) continue;
+
+      const expr = statement.expression;
+      if (!ts.isCallExpression(expr)) continue;
+      if (!ts.isIdentifier(expr.expression)) continue;
+      if (expr.expression.text !== "setInterval") continue;
+      if (expr.arguments.length < 2) continue;
+
+      const callback = expr.arguments[0];
+      const intervalArg = expr.arguments[1];
+
+      // Interval must be a statically resolvable numeric value
+      const intervalMs = resolveConstantNumeric(intervalArg);
+      if (intervalMs === null) {
+        console.warn(
+          `⚠ Warning: setInterval at ${file}:${sourceFile.getLineAndCharacterOfPosition(expr.getStart()).line + 1} ` +
+          `has a dynamic interval and cannot be made durable. Use a numeric literal.`
+        );
+        continue;
+      }
+
+      // Callback must be an arrow function or function expression
+      if (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback)) continue;
+
+      const fetchCall = extractSingleFetchCall(callback.body);
+      if (!fetchCall) {
+        // Check if the callback has any content (not empty) to decide whether to warn
+        if (hasStatements(callback.body)) {
+          console.warn(
+            `⚠ Warning: setInterval at ${file}:${sourceFile.getLineAndCharacterOfPosition(expr.getStart()).line + 1} ` +
+            `contains inline logic and will not survive restarts. ` +
+            `If this should be durable, move logic to an endpoint and use fetch().`
+          );
+        }
+        continue;
+      }
+
+      const { endpoint, method } = fetchCall;
+
+      // Must be a /job/* route — Dapr calls POST /job/<name> directly
+      if (!endpoint.startsWith("/job/")) continue;
+
+      // Derive job name from the path after /job/
+      const name = endpoint.slice("/job/".length).replace(/\//g, "-");
+
+      results.push({ name, endpoint, method, intervalMs, file });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Check if a node has statements (is not an empty body).
+ */
+function hasStatements(body: ts.ConciseBody): boolean {
+  if (ts.isBlock(body)) {
+    return body.statements.length > 0;
+  }
+  // Expression body always has content
+  return true;
+}
+
+/**
+ * Extract a single fetch() call from a callback body.
+ * Returns null if the body contains anything other than a single fetch call.
+ *
+ * Handles:
+ *   - Arrow expression body: () => fetch('/path')
+ *   - Block body with single statement: () => { fetch('/path') }
+ *   - Block body with single statement + semicolon: () => { fetch('/path'); }
+ */
+function extractSingleFetchCall(
+  body: ts.ConciseBody
+): { endpoint: string; method: string } | null {
+  let callExpr: ts.CallExpression | null = null;
+
+  if (ts.isBlock(body)) {
+    // Block body — must have exactly one expression statement
+    if (body.statements.length !== 1) return null;
+    const stmt = body.statements[0];
+    if (!ts.isExpressionStatement(stmt)) return null;
+    if (!ts.isCallExpression(stmt.expression)) return null;
+    callExpr = stmt.expression;
+  } else {
+    // Expression body — must be a call expression
+    if (!ts.isCallExpression(body)) return null;
+    callExpr = body;
+  }
+
+  // Must be a call to `fetch`
+  if (!ts.isIdentifier(callExpr.expression)) return null;
+  if (callExpr.expression.text !== "fetch") return null;
+  if (callExpr.arguments.length < 1) return null;
+
+  // First arg must be a string literal
+  const urlArg = callExpr.arguments[0];
+  if (!ts.isStringLiteral(urlArg)) return null;
+  const endpoint = urlArg.text;
+
+  // Extract method from second arg (options object) if present
+  let method = "GET";
+  if (callExpr.arguments.length >= 2) {
+    const options = callExpr.arguments[1];
+    if (ts.isObjectLiteralExpression(options)) {
+      for (const prop of options.properties) {
+        if (
+          ts.isPropertyAssignment(prop) &&
+          ts.isIdentifier(prop.name) &&
+          prop.name.text === "method" &&
+          ts.isStringLiteral(prop.initializer)
+        ) {
+          method = prop.initializer.text;
+        }
+      }
+    }
+  }
+
+  return { endpoint, method };
+}
+
+/**
+ * Resolve a constant numeric expression at compile time.
+ * Handles:
+ *   - Numeric literals: 86400000
+ *   - Multiplication chains: 24 * 60 * 60 * 1000
+ *   - Parenthesized expressions: (24 * 60) * 60 * 1000
+ */
+function resolveConstantNumeric(expr: ts.Expression): number | null {
+  if (ts.isNumericLiteral(expr)) {
+    return parseFloat(expr.text);
+  }
+
+  if (ts.isParenthesizedExpression(expr)) {
+    return resolveConstantNumeric(expr.expression);
+  }
+
+  if (ts.isBinaryExpression(expr)) {
+    const left = resolveConstantNumeric(expr.left);
+    const right = resolveConstantNumeric(expr.right);
+    if (left === null || right === null) return null;
+
+    switch (expr.operatorToken.kind) {
+      case ts.SyntaxKind.AsteriskToken: return left * right;
+      case ts.SyntaxKind.PlusToken: return left + right;
+      case ts.SyntaxKind.MinusToken: return left - right;
+      default: return null;
+    }
+  }
+
+  return null;
 }

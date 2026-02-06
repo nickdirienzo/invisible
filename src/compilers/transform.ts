@@ -119,6 +119,96 @@ export function createDurableMapTransformer(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Cron job transformer — removes durable setInterval calls from compiled output
+// ---------------------------------------------------------------------------
+
+interface CronJobEntry {
+  endpoint: string;
+  name: string;
+}
+
+interface CronManifestEntry {
+  file: string;
+  jobs: CronJobEntry[];
+}
+
+/**
+ * Creates a TypeScript custom transformer that removes module-scope
+ * `setInterval(() => fetch('/...'), ms)` calls that have been registered
+ * as durable cron jobs with Dapr.
+ *
+ * The removed calls are replaced with empty statements so line numbers
+ * in the output remain stable for debugging.
+ */
+export function createCronJobTransformer(
+  manifest: CronManifestEntry[],
+): ts.TransformerFactory<ts.SourceFile> {
+  return (context) => {
+    return (sourceFile) => {
+      const entry = manifest.find((e) => {
+        const jsName = e.file.replace(/\.ts$/, ".js").replace(/\.mts$/, ".mjs");
+        return (
+          sourceFile.fileName.endsWith(e.file) ||
+          sourceFile.fileName.endsWith(jsName)
+        );
+      });
+
+      if (!entry || entry.jobs.length === 0) return sourceFile;
+
+      const endpoints = new Set(entry.jobs.map((j) => j.endpoint));
+
+      const visitor: ts.Visitor = (node) => {
+        if (
+          ts.isExpressionStatement(node) &&
+          node.parent === sourceFile &&
+          ts.isCallExpression(node.expression) &&
+          ts.isIdentifier(node.expression.expression) &&
+          node.expression.expression.text === "setInterval" &&
+          node.expression.arguments.length >= 2
+        ) {
+          const callback = node.expression.arguments[0];
+          if (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)) {
+            const fetchEndpoint = extractFetchEndpoint(callback.body);
+            if (fetchEndpoint && endpoints.has(fetchEndpoint)) {
+              // Replace with empty statement
+              return context.factory.createEmptyStatement();
+            }
+          }
+        }
+
+        return ts.visitEachChild(node, visitor, context);
+      };
+
+      return ts.visitEachChild(sourceFile, visitor, context);
+    };
+  };
+}
+
+function extractFetchEndpoint(body: ts.ConciseBody): string | null {
+  let callExpr: ts.CallExpression | null = null;
+
+  if (ts.isBlock(body)) {
+    if (body.statements.length !== 1) return null;
+    const stmt = body.statements[0];
+    if (!ts.isExpressionStatement(stmt)) return null;
+    if (!ts.isCallExpression(stmt.expression)) return null;
+    callExpr = stmt.expression;
+  } else {
+    if (!ts.isCallExpression(body)) return null;
+    callExpr = body;
+  }
+
+  if (!ts.isIdentifier(callExpr.expression)) return null;
+  if (callExpr.expression.text !== "fetch") return null;
+  if (callExpr.arguments.length < 1) return null;
+
+  const urlArg = callExpr.arguments[0];
+  if (!ts.isStringLiteral(urlArg)) return null;
+
+  return urlArg.text;
+}
+
 /**
  * Compiles TypeScript files with the DurableMap transformer applied.
  * This is the build function called from the generated build script
