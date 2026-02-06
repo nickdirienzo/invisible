@@ -19,9 +19,10 @@ export function plan(projectDir: string): App {
   const { program, checker } = createProgram(projectDir, sourceFiles);
 
   const listenResult = detectListenCall(program, checker, projectDir, sourceFiles);
-  const hasIngress = listenResult !== null;
+  const frameworkResult = !listenResult ? detectFrameworkStart(pkg) : null;
+  const hasIngress = listenResult !== null || frameworkResult !== null;
   const entrypoint = listenResult?.file ?? detectEntrypoint(sourceFiles);
-  const typescript = entrypoint.endsWith(".ts") || entrypoint.endsWith(".mts");
+  const typescript = entrypoint.endsWith(".ts") || entrypoint.endsWith(".tsx") || entrypoint.endsWith(".mts");
 
   const durableMaps = detectDurableMaps(program, projectDir, sourceFiles);
   const secrets = detectSecrets(program, projectDir, sourceFiles);
@@ -44,10 +45,12 @@ export function plan(projectDir: string): App {
       {
         name: "web",
         build: "./",
-        port: listenResult?.port ?? 3000,
+        port: listenResult?.port ?? frameworkResult?.port ?? 3000,
         entrypoint,
         typescript,
         ...(hasIngress ? { ingress: [{ host: "", path: "/" }] } : {}),
+        ...(frameworkResult?.startCmd ? { startCmd: frameworkResult.startCmd } : {}),
+        ...(frameworkResult?.buildCmd ? { buildCmd: frameworkResult.buildCmd } : {}),
       },
     ],
     ...(resources.length > 0 ? { resources } : {}),
@@ -84,6 +87,40 @@ function detectEntrypoint(files: string[]): string {
   if (files.includes("index.ts")) return "index.ts";
   if (files.includes("index.js")) return "index.js";
   return files[0] ?? "index.js";
+}
+
+// ---------------------------------------------------------------------------
+// Framework detection — check package.json scripts.start + scripts.build
+// ---------------------------------------------------------------------------
+
+interface FrameworkResult {
+  port: number;
+  startCmd: string;
+  buildCmd: string;
+}
+
+/**
+ * Detects framework-based apps from scripts.start + scripts.build in
+ * package.json. Both are required — this is an opinionated contract.
+ *
+ * Only checked when no explicit .listen() call is found in source code.
+ * Covers Remix, Next, Nuxt, SvelteKit, Astro, etc. without needing
+ * framework-specific knowledge.
+ */
+function detectFrameworkStart(pkg: PackageJson): FrameworkResult | null {
+  const startScript = pkg.scripts?.start;
+  const buildScript = pkg.scripts?.build;
+  if (!startScript || !buildScript) return null;
+
+  // Extract port from --port flag if present, otherwise default to 3000
+  const portMatch = startScript.match(/--port\s+(\d+)/);
+  const port = portMatch ? parseInt(portMatch[1], 10) : 3000;
+
+  return {
+    port,
+    startCmd: startScript,
+    buildCmd: buildScript,
+  };
 }
 
 // ---------------------------------------------------------------------------
