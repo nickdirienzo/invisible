@@ -24,11 +24,19 @@ export function plan(projectDir: string): App {
   const typescript = entrypoint.endsWith(".ts") || entrypoint.endsWith(".mts");
 
   const durableMaps = detectDurableMaps(program, projectDir, sourceFiles);
-  const resources: Resource[] = durableMaps.map((m) => ({
-    kind: "durable-map" as const,
-    name: m.name,
-    sourceFile: m.file,
-  }));
+  const secrets = detectSecrets(program, projectDir, sourceFiles);
+  const resources: Resource[] = [
+    ...durableMaps.map((m) => ({
+      kind: "durable-map" as const,
+      name: m.name,
+      sourceFile: m.file,
+    })),
+    ...secrets.map((s) => ({
+      kind: "secret" as const,
+      name: s.name,
+      sourceFile: s.file,
+    })),
+  ];
 
   return {
     name: appName,
@@ -314,4 +322,101 @@ function detectDurableMaps(
   }
 
   return results;
+}
+
+// ---------------------------------------------------------------------------
+// Secret detection (ADR-0008: process.env → OpenBao)
+// ---------------------------------------------------------------------------
+
+interface SecretDetection {
+  name: string;
+  file: string;
+}
+
+/** Env vars that are infrastructure-managed or non-secret */
+const EXCLUDED_ENV_VARS = new Set([
+  "PORT",
+  "NODE_ENV",
+  "VALKEY_URL",
+  "OPENBAO_ADDR",
+  "OPENBAO_TOKEN",
+  "HOST",
+  "HOSTNAME",
+  "HOME",
+  "PATH",
+  "PWD",
+  "USER",
+  "SHELL",
+  "TERM",
+  "TZ",
+  "LANG",
+  "LC_ALL",
+]);
+
+/**
+ * Walk the full AST looking for `process.env` access patterns.
+ * Unlike durable maps, env vars can be accessed anywhere (not just module scope).
+ * Handles:
+ *   - process.env.VARIABLE_NAME (PropertyAccessExpression)
+ *   - process.env["VARIABLE_NAME"] (ElementAccessExpression with string literal)
+ * Dynamic access like process.env[someVar] is silently skipped (ADR-0008 limitation).
+ */
+function detectSecrets(
+  program: ts.Program,
+  projectDir: string,
+  files: string[]
+): SecretDetection[] {
+  const results: SecretDetection[] = [];
+  const seen = new Set<string>();
+
+  for (const file of files) {
+    const sourceFile = program.getSourceFile(join(projectDir, file));
+    if (!sourceFile) continue;
+
+    walkForProcessEnv(sourceFile, (envVarName) => {
+      const key = `${file}:${envVarName}`;
+      if (!seen.has(key) && !EXCLUDED_ENV_VARS.has(envVarName)) {
+        seen.add(key);
+        results.push({ name: envVarName, file });
+      }
+    });
+  }
+
+  return results;
+}
+
+function walkForProcessEnv(
+  sourceFile: ts.SourceFile,
+  onFound: (envVarName: string) => void
+): void {
+  function visit(node: ts.Node) {
+    // Pattern 1: process.env.VARIABLE_NAME
+    if (
+      ts.isPropertyAccessExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      ts.isIdentifier(node.expression.expression) &&
+      node.expression.expression.text === "process" &&
+      node.expression.name.text === "env"
+    ) {
+      onFound(node.name.text);
+      return;
+    }
+
+    // Pattern 2: process.env["VARIABLE_NAME"]
+    if (
+      ts.isElementAccessExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      ts.isIdentifier(node.expression.expression) &&
+      node.expression.expression.text === "process" &&
+      node.expression.name.text === "env" &&
+      ts.isStringLiteral(node.argumentExpression)
+    ) {
+      onFound(node.argumentExpression.text);
+      return;
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
 }
