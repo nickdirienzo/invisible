@@ -1,8 +1,13 @@
 import { stringify } from "yaml";
 import type { App } from "../ir/index.js";
 
+interface ComposeBuild {
+  context: string;
+  dockerfile: string;
+}
+
 interface ComposeService {
-  build: string;
+  build: ComposeBuild;
   ports?: string[];
   environment?: Record<string, string>;
 }
@@ -16,7 +21,10 @@ export function compileToCompose(app: App): string {
 
   for (const svc of app.services) {
     const composeSvc: ComposeService = {
-      build: svc.build,
+      build: {
+        context: "..",
+        dockerfile: ".ii/Dockerfile",
+      },
     };
 
     if (svc.ingress?.length) {

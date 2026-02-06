@@ -26,7 +26,7 @@ describe("compileToCompose", () => {
     const doc = parse(output);
 
     expect(doc.services.web).toBeDefined();
-    expect(doc.services.web.build).toBe("./");
+    expect(doc.services.web.build).toEqual({ context: "..", dockerfile: ".ii/Dockerfile" });
     expect(doc.services.web.ports).toEqual(["3000:3000"]);
     expect(doc.services.web.environment).toEqual({ NODE_ENV: "production" });
   });
