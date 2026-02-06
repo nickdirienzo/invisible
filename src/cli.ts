@@ -90,9 +90,21 @@ function doPlan(projectDir: string) {
   }
 
   if (app.resources?.length) {
-    console.log(`\n  resources:`);
-    for (const r of app.resources) {
-      console.log(`    ${r.kind}: ${r.name} (${r.sourceFile})`);
+    const durableMaps = app.resources.filter((r) => r.kind === "durable-map");
+    const secrets = app.resources.filter((r) => r.kind === "secret");
+
+    if (durableMaps.length > 0) {
+      console.log(`\n  durable maps:`);
+      for (const r of durableMaps) {
+        console.log(`    ${r.name} (${r.sourceFile})`);
+      }
+    }
+
+    if (secrets.length > 0) {
+      console.log(`\n  secrets:`);
+      for (const r of secrets) {
+        console.log(`    ${r.name} (${r.sourceFile})`);
+      }
     }
   }
 
@@ -138,18 +150,26 @@ function doDeployLocal({ projectDir, planFile }: DeployOpts) {
   const startCmd = getStartCmd(projectDir);
   const svc = app.services[0];
   const out = iiDir(projectDir);
-  const hasResources = (app.resources?.length ?? 0) > 0;
+  const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
+  const hasSecretResources = app.resources?.some((r) => r.kind === "secret") ?? false;
 
   writeFileSync(
     join(out, "Dockerfile"),
-    compileToDockerfile(svc, startCmd, hasResources ? { hasResources: true } : undefined)
+    compileToDockerfile(svc, startCmd, {
+      hasResources: hasMaps,
+      hasSecrets: hasSecretResources,
+    })
   );
   writeFileSync(join(out, "docker-compose.yml"), compileToCompose(app));
 
-  if (hasResources) {
+  if (hasMaps) {
     writeResourceManifest(out, app);
     writeBuildScript(out);
     writeDurableMapRuntime(out);
+  }
+
+  if (hasSecretResources) {
+    writeSecretsShim(out);
   }
 
   console.log(`${app.name}: deploying ${app.services.length} service(s) locally...\n`);
@@ -165,18 +185,26 @@ function doDeployK8s({ projectDir, planFile }: DeployOpts) {
   const startCmd = getStartCmd(projectDir);
   const svc = app.services[0];
   const out = iiDir(projectDir);
-  const hasResources = (app.resources?.length ?? 0) > 0;
+  const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
+  const hasSecretResources = app.resources?.some((r) => r.kind === "secret") ?? false;
 
   writeFileSync(
     join(out, "Dockerfile"),
-    compileToDockerfile(svc, startCmd, hasResources ? { hasResources: true } : undefined)
+    compileToDockerfile(svc, startCmd, {
+      hasResources: hasMaps,
+      hasSecrets: hasSecretResources,
+    })
   );
   writeFileSync(join(out, "k8s.yml"), compileToK8s(app));
 
-  if (hasResources) {
+  if (hasMaps) {
     writeResourceManifest(out, app);
     writeBuildScript(out);
     writeDurableMapRuntime(out);
+  }
+
+  if (hasSecretResources) {
+    writeSecretsShim(out);
   }
 
   console.log(`${app.name}: compiled ${app.services.length} service(s)\n`);
@@ -385,6 +413,52 @@ export class DurableMap {
     const c = await getClient();
     const all = await c.hgetall(this.#hashKey);
     return Object.entries(all).map(([k, v]) => [k, JSON.parse(v)]);
+  }
+}
+`);
+}
+
+/**
+ * Write .ii/runtime/secrets-shim.mjs — a Node --import hook that fetches
+ * secrets from OpenBao and populates process.env before the app starts.
+ * Uses Node 22's built-in fetch(), no npm dependencies needed.
+ */
+function writeSecretsShim(out: string) {
+  const runtimeDir = join(out, "runtime");
+  mkdirSync(runtimeDir, { recursive: true });
+
+  writeFileSync(join(runtimeDir, "secrets-shim.mjs"), `\
+// Secrets shim — runs via node --import before the app starts.
+// Reads secret names from OPENBAO_SECRETS, seeds dev values,
+// then fetches from OpenBao and populates process.env.
+
+const addr = process.env.OPENBAO_ADDR;
+const token = process.env.OPENBAO_TOKEN;
+const secretNames = JSON.parse(process.env.OPENBAO_SECRETS || "[]");
+
+if (addr && token && secretNames.length > 0) {
+  // Seed each secret with a dev placeholder (idempotent — overwrites on each start)
+  for (const name of secretNames) {
+    await fetch(\`\${addr}/v1/secret/data/\${name}\`, {
+      method: "PUT",
+      headers: { "X-Vault-Token": token, "Content-Type": "application/json" },
+      body: JSON.stringify({ data: { value: \`\${name}-dev-value\` } }),
+    }).catch(() => {});
+  }
+
+  // Fetch each secret and populate process.env
+  for (const name of secretNames) {
+    try {
+      const res = await fetch(\`\${addr}/v1/secret/data/\${name}\`, {
+        headers: { "X-Vault-Token": token },
+      });
+      if (res.ok) {
+        const json = await res.json();
+        process.env[name] = json.data?.data?.value ?? "";
+      }
+    } catch {
+      // OpenBao not ready yet — leave env var unset
+    }
   }
 }
 `);

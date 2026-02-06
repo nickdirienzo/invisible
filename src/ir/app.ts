@@ -31,4 +31,10 @@ export interface DurableMapResource {
   sourceFile: string;
 }
 
-export type Resource = DurableMapResource;
+export interface SecretResource {
+  kind: "secret";
+  name: string;
+  sourceFile: string;
+}
+
+export type Resource = DurableMapResource | SecretResource;
