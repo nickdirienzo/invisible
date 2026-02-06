@@ -1,0 +1,18 @@
+{
+  "name": "01-hello-world",
+  "services": [
+    {
+      "name": "web",
+      "build": "./",
+      "port": 3000,
+      "entrypoint": "index.ts",
+      "typescript": true,
+      "ingress": [
+        {
+          "host": "",
+          "path": "/"
+        }
+      ]
+    }
+  ]
+}
