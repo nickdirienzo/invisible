@@ -21,6 +21,7 @@
     "vitest": "^3.0.0"
   },
   "dependencies": {
+    "@valkey/valkey-glide": "^2.2.6",
     "yaml": "^2.7.0"
   }
 }

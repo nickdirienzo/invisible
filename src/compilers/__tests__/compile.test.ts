@@ -80,3 +80,72 @@ describe("compileToK8s", () => {
     expect(docs.map((d) => d.kind)).toEqual(["Deployment", "Service"]);
   });
 });
+
+const counterApp: App = {
+  name: "counter-app",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "index.ts",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+    },
+  ],
+  resources: [
+    { kind: "durable-map", name: "counters", sourceFile: "index.ts" },
+  ],
+};
+
+describe("compileToCompose with resources", () => {
+  it("adds valkey service when durable maps present", () => {
+    const doc = parse(compileToCompose(counterApp));
+    expect(doc.services.valkey).toBeDefined();
+    expect(doc.services.valkey.image).toBe("valkey/valkey:8-alpine");
+  });
+
+  it("injects VALKEY_URL into app service", () => {
+    const doc = parse(compileToCompose(counterApp));
+    expect(doc.services.web.environment.VALKEY_URL).toBe("valkey://valkey:6379");
+  });
+
+  it("adds depends_on for valkey", () => {
+    const doc = parse(compileToCompose(counterApp));
+    expect(doc.services.web.depends_on).toContain("valkey");
+  });
+});
+
+describe("compileToK8s with resources", () => {
+  it("adds Valkey Deployment and Service", () => {
+    const docs = compileToK8s(counterApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const valkeyDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "valkey"
+    );
+    expect(valkeyDeploy).toBeDefined();
+    expect(
+      valkeyDeploy.spec.template.spec.containers[0].image
+    ).toBe("valkey/valkey:8-alpine");
+
+    const valkeySvc = docs.find(
+      (d) => d.kind === "Service" && d.metadata.name === "valkey"
+    );
+    expect(valkeySvc).toBeDefined();
+    expect(valkeySvc.spec.ports[0].port).toBe(6379);
+  });
+
+  it("injects VALKEY_URL env var into app containers", () => {
+    const docs = compileToK8s(counterApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const webDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "web"
+    );
+    const env = webDeploy.spec.template.spec.containers[0].env;
+    expect(env).toContainEqual({ name: "VALKEY_URL", value: "valkey://valkey:6379" });
+  });
+});

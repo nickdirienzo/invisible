@@ -2,7 +2,7 @@ import { readdirSync } from "node:fs";
 import { readFileSync } from "node:fs";
 import { join, basename } from "node:path";
 import ts from "typescript";
-import type { App } from "../ir/index.js";
+import type { App, Resource } from "../ir/index.js";
 
 interface PackageJson {
   name?: string;
@@ -15,10 +15,20 @@ export function plan(projectDir: string): App {
   const appName = pkg.name ?? basename(projectDir);
   const sourceFiles = findSourceFiles(projectDir);
 
-  const listenResult = detectListenCall(projectDir, sourceFiles);
+  // Create one ts.Program shared across all detectors
+  const { program, checker } = createProgram(projectDir, sourceFiles);
+
+  const listenResult = detectListenCall(program, checker, projectDir, sourceFiles);
   const hasIngress = listenResult !== null;
   const entrypoint = listenResult?.file ?? detectEntrypoint(sourceFiles);
   const typescript = entrypoint.endsWith(".ts") || entrypoint.endsWith(".mts");
+
+  const durableMaps = detectDurableMaps(program, projectDir, sourceFiles);
+  const resources: Resource[] = durableMaps.map((m) => ({
+    kind: "durable-map" as const,
+    name: m.name,
+    sourceFile: m.file,
+  }));
 
   return {
     name: appName,
@@ -32,6 +42,7 @@ export function plan(projectDir: string): App {
         ...(hasIngress ? { ingress: [{ host: "", path: "/" }] } : {}),
       },
     ],
+    ...(resources.length > 0 ? { resources } : {}),
   };
 }
 
@@ -46,11 +57,30 @@ function findSourceFiles(dir: string): string[] {
     .map((e) => e.name);
 }
 
+function createProgram(projectDir: string, files: string[]) {
+  const filePaths = files.map((f) => join(projectDir, f));
+  const program = ts.createProgram(filePaths, {
+    target: ts.ScriptTarget.Latest,
+    module: ts.ModuleKind.Node16,
+    moduleResolution: ts.ModuleResolutionKind.Node16,
+    esModuleInterop: true,
+    skipLibCheck: true,
+    noEmit: true,
+    baseUrl: projectDir,
+  });
+  const checker = program.getTypeChecker();
+  return { program, checker };
+}
+
 function detectEntrypoint(files: string[]): string {
   if (files.includes("index.ts")) return "index.ts";
   if (files.includes("index.js")) return "index.js";
   return files[0] ?? "index.js";
 }
+
+// ---------------------------------------------------------------------------
+// Listen detection
+// ---------------------------------------------------------------------------
 
 interface ListenResult {
   file: string;
@@ -60,29 +90,13 @@ interface ListenResult {
 /**
  * Uses the TypeScript type checker to find .listen() calls on objects
  * whose type traces back to node:http, node:net, or known HTTP frameworks.
- *
- * This avoids false positives from unrelated .listen() methods — only
- * matches when the type system confirms it's a server.
  */
 function detectListenCall(
+  program: ts.Program,
+  checker: ts.TypeChecker,
   projectDir: string,
   files: string[]
 ): ListenResult | null {
-  const filePaths = files.map((f) => join(projectDir, f));
-
-  const program = ts.createProgram(filePaths, {
-    target: ts.ScriptTarget.Latest,
-    module: ts.ModuleKind.Node16,
-    moduleResolution: ts.ModuleResolutionKind.Node16,
-    esModuleInterop: true,
-    skipLibCheck: true,
-    noEmit: true,
-    // Resolve types from node_modules
-    baseUrl: projectDir,
-  });
-
-  const checker = program.getTypeChecker();
-
   for (const file of files) {
     const sourceFile = program.getSourceFile(join(projectDir, file));
     if (!sourceFile) continue;
@@ -254,4 +268,50 @@ function resolveExpression(expr: ts.Expression): number | null {
   }
 
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Durable Map detection (ADR-0003: module-scope = durable)
+// ---------------------------------------------------------------------------
+
+interface DurableMapDetection {
+  name: string;
+  file: string;
+}
+
+/**
+ * Walk top-level statements looking for `new Map()` declarations.
+ * Only module-scope (top-level) Maps are considered durable.
+ * Function-scoped Maps are ephemeral and ignored.
+ */
+function detectDurableMaps(
+  program: ts.Program,
+  projectDir: string,
+  files: string[]
+): DurableMapDetection[] {
+  const results: DurableMapDetection[] = [];
+
+  for (const file of files) {
+    const sourceFile = program.getSourceFile(join(projectDir, file));
+    if (!sourceFile) continue;
+
+    // Only iterate top-level statements — this is module scope
+    for (const statement of sourceFile.statements) {
+      if (!ts.isVariableStatement(statement)) continue;
+
+      for (const decl of statement.declarationList.declarations) {
+        if (
+          decl.initializer &&
+          ts.isNewExpression(decl.initializer) &&
+          ts.isIdentifier(decl.initializer.expression) &&
+          decl.initializer.expression.text === "Map" &&
+          ts.isIdentifier(decl.name)
+        ) {
+          results.push({ name: decl.name.text, file });
+        }
+      }
+    }
+  }
+
+  return results;
 }

@@ -1,6 +1,7 @@
 export interface App {
   name: string;
   services: Service[];
+  resources?: Resource[];
 }
 
 export interface Service {
@@ -23,3 +24,11 @@ export interface ScaleBounds {
   min: number;
   max: number;
 }
+
+export interface DurableMapResource {
+  kind: "durable-map";
+  name: string;
+  sourceFile: string;
+}
+
+export type Resource = DurableMapResource;
