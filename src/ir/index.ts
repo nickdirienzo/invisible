@@ -1,1 +1,1 @@
-export type { App, Service, IngressRule, ScaleBounds, Resource, DurableMapResource, SecretResource } from "./app.js";
+export type { App, Service, IngressRule, ScaleBounds, Resource, DurableMapResource, SecretResource, CronJobResource } from "./app.js";

@@ -41,4 +41,13 @@ export interface SecretResource {
   sourceFile: string;
 }
 
-export type Resource = DurableMapResource | SecretResource;
+export interface CronJobResource {
+  kind: "cron-job";
+  name: string;
+  endpoint: string;
+  method: string;
+  intervalMs: number;
+  sourceFile: string;
+}
+
+export type Resource = DurableMapResource | SecretResource | CronJobResource;

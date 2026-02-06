@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { resolve, join } from "node:path";
 import type { App } from "./ir/index.js";
 import { plan } from "./planner/index.js";
@@ -51,7 +51,7 @@ function iiDir(projectDir: string): string {
   return dir;
 }
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   const command = args[0];
 
@@ -62,7 +62,7 @@ function main() {
     const opts = parseDeployArgs(args.slice(1));
 
     if (opts.target === "--local") {
-      doDeployLocal(opts);
+      await doDeployLocal(opts);
     } else if (opts.target === "--k8s") {
       doDeployK8s(opts);
     } else {
@@ -106,6 +106,17 @@ function doPlan(projectDir: string) {
         console.log(`    ${r.name} (${r.sourceFile})`);
       }
     }
+
+    const cronJobs = app.resources.filter((r) => r.kind === "cron-job");
+    if (cronJobs.length > 0) {
+      console.log(`\n  cron jobs:`);
+      for (const r of cronJobs) {
+        if (r.kind === "cron-job") {
+          const seconds = Math.round(r.intervalMs / 1000);
+          console.log(`    ${r.method} ${r.endpoint} every ${seconds}s (${r.sourceFile})`);
+        }
+      }
+    }
   }
 
   console.log(`\nPlan written to ${II_DIR}/${PLAN_FILE}`);
@@ -143,41 +154,158 @@ function writeResourceManifest(out: string, app: App) {
   }));
 
   writeFileSync(join(out, RESOURCES_FILE), JSON.stringify(manifest, null, 2) + "\n");
+
+  // Write cron jobs manifest for the transformer
+  const cronByFile = new Map<string, Array<{ endpoint: string; name: string }>>();
+  for (const r of app.resources) {
+    if (r.kind === "cron-job") {
+      const jobs = cronByFile.get(r.sourceFile) ?? [];
+      jobs.push({ endpoint: r.endpoint, name: r.name });
+      cronByFile.set(r.sourceFile, jobs);
+    }
+  }
+
+  if (cronByFile.size > 0) {
+    const cronManifest = Array.from(cronByFile.entries()).map(([file, jobs]) => ({
+      file,
+      jobs,
+    }));
+    writeFileSync(join(out, "cron-jobs.json"), JSON.stringify(cronManifest, null, 2) + "\n");
+  }
 }
 
-function doDeployLocal({ projectDir, planFile }: DeployOpts) {
+async function doDeployLocal({ projectDir, planFile }: DeployOpts) {
   const app = loadOrPlan(projectDir, planFile);
   const startCmd = getStartCmd(projectDir);
   const svc = app.services[0];
   const out = iiDir(projectDir);
   const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
   const hasSecretResources = app.resources?.some((r) => r.kind === "secret") ?? false;
+  const hasCron = app.resources?.some((r) => r.kind === "cron-job") ?? false;
 
   writeFileSync(
     join(out, "Dockerfile"),
     compileToDockerfile(svc, startCmd, {
       hasResources: hasMaps,
       hasSecrets: hasSecretResources,
+      hasCronJobs: hasCron,
     })
   );
   writeFileSync(join(out, "docker-compose.yml"), compileToCompose(app));
 
-  if (hasMaps) {
+  if (hasMaps || hasCron) {
     writeResourceManifest(out, app);
-    writeBuildScript(out);
-    writeDurableMapRuntime(out);
+    writeBuildScript(out, app);
+    if (hasMaps) writeDurableMapRuntime(out);
   }
 
   if (hasSecretResources) {
     writeSecretsShim(out);
   }
 
+  if (hasCron) {
+    writeDaprComponents(out);
+  }
+
   console.log(`${app.name}: deploying ${app.services.length} service(s) locally...\n`);
 
-  execSync(`docker compose -f ${II_DIR}/docker-compose.yml up --build`, {
+  // Start everything in detached mode
+  execSync(`docker compose -f ${II_DIR}/docker-compose.yml up -d --build`, {
     cwd: projectDir,
     stdio: "inherit",
   });
+
+  // Reconcile cron jobs at deploy time (not per-replica at startup)
+  if (hasCron) {
+    const cronJobs = (app.resources ?? []).filter(
+      (r): r is import("./ir/index.js").CronJobResource => r.kind === "cron-job"
+    );
+    await reconcileCronJobs(cronJobs);
+  }
+
+  // Stream logs in foreground — Ctrl+C stops tailing but containers keep running
+  const logs = spawn(
+    "docker", ["compose", "-f", `${II_DIR}/docker-compose.yml`, "logs", "-f"],
+    { cwd: projectDir, stdio: "inherit" }
+  );
+
+  process.on("SIGINT", () => logs.kill("SIGINT"));
+
+  await new Promise<void>((res) => logs.on("close", () => res()));
+}
+
+/**
+ * Reconcile cron jobs with the Dapr Jobs API from the CLI.
+ * Runs once at deploy time — not per-replica at app startup.
+ *
+ * 1. Wait for Dapr sidecar healthz (exposed on host port 3500)
+ * 2. Read previously registered job names from Dapr state store
+ * 3. Delete stale jobs (in prev but not in current)
+ * 4. Register current jobs
+ * 5. Save current job names to state store
+ */
+async function reconcileCronJobs(
+  cronJobs: import("./ir/index.js").CronJobResource[]
+): Promise<void> {
+  const DAPR_BASE = "http://localhost:3500";
+  const STATE_STORE = "ii-state";
+  const STATE_KEY = "registered-cron-jobs";
+
+  // Wait for Dapr sidecar to be ready
+  console.log("  Waiting for Dapr sidecar...");
+  for (let i = 0; i < 30; i++) {
+    try {
+      const res = await fetch(`${DAPR_BASE}/v1.0/healthz`);
+      if (res.ok) break;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  // Read previously registered job names from Dapr state store
+  let prevNames: string[] = [];
+  try {
+    const res = await fetch(`${DAPR_BASE}/v1.0/state/${STATE_STORE}/${STATE_KEY}`);
+    if (res.ok) {
+      prevNames = await res.json() as string[];
+    }
+  } catch {}
+
+  // Delete stale jobs — names in prev but not in current
+  const currentNames = new Set(cronJobs.map((j) => j.name));
+  for (const name of prevNames) {
+    if (!currentNames.has(name)) {
+      try {
+        await fetch(`${DAPR_BASE}/v1.0-alpha1/jobs/${name}`, { method: "DELETE" });
+        console.log(`  Deleted stale cron job: ${name}`);
+      } catch {}
+    }
+  }
+
+  // Register each current job
+  for (const job of cronJobs) {
+    try {
+      await fetch(`${DAPR_BASE}/v1.0-alpha1/jobs/${job.name}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          schedule: `@every ${job.intervalMs}ms`,
+          data: { jobName: job.name },
+        }),
+      });
+      console.log(`  Registered cron job: ${job.name} (every ${job.intervalMs}ms)`);
+    } catch (err) {
+      console.error(`  Failed to register cron job ${job.name}:`, (err as Error).message);
+    }
+  }
+
+  // Save current job names to state store for next reconciliation
+  try {
+    await fetch(`${DAPR_BASE}/v1.0/state/${STATE_STORE}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify([{ key: STATE_KEY, value: [...currentNames] }]),
+    });
+  } catch {}
 }
 
 function doDeployK8s({ projectDir, planFile }: DeployOpts) {
@@ -187,24 +315,30 @@ function doDeployK8s({ projectDir, planFile }: DeployOpts) {
   const out = iiDir(projectDir);
   const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
   const hasSecretResources = app.resources?.some((r) => r.kind === "secret") ?? false;
+  const hasCron = app.resources?.some((r) => r.kind === "cron-job") ?? false;
 
   writeFileSync(
     join(out, "Dockerfile"),
     compileToDockerfile(svc, startCmd, {
       hasResources: hasMaps,
       hasSecrets: hasSecretResources,
+      hasCronJobs: hasCron,
     })
   );
   writeFileSync(join(out, "k8s.yml"), compileToK8s(app));
 
-  if (hasMaps) {
+  if (hasMaps || hasCron) {
     writeResourceManifest(out, app);
-    writeBuildScript(out);
-    writeDurableMapRuntime(out);
+    writeBuildScript(out, app);
+    if (hasMaps) writeDurableMapRuntime(out);
   }
 
   if (hasSecretResources) {
     writeSecretsShim(out);
+  }
+
+  if (hasCron) {
+    writeDaprComponents(out);
   }
 
   console.log(`${app.name}: compiled ${app.services.length} service(s)\n`);
@@ -217,15 +351,22 @@ function doDeployK8s({ projectDir, planFile }: DeployOpts) {
  * with our custom transformer to swap new Map() → new DurableMap().
  * Called from the Dockerfile instead of `npx tsc --outDir dist`.
  */
-function writeBuildScript(out: string) {
+function writeBuildScript(out: string, app: App) {
+  const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
+  const hasCron = app.resources?.some((r) => r.kind === "cron-job") ?? false;
+
   writeFileSync(join(out, "build.mjs"), `\
 import ts from "typescript";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
-const manifest = JSON.parse(
-  readFileSync(join(process.cwd(), ".ii", "resources.json"), "utf-8")
-);
+const manifest = existsSync(join(process.cwd(), ".ii", "resources.json"))
+  ? JSON.parse(readFileSync(join(process.cwd(), ".ii", "resources.json"), "utf-8"))
+  : [];
+
+const cronManifest = existsSync(join(process.cwd(), ".ii", "cron-jobs.json"))
+  ? JSON.parse(readFileSync(join(process.cwd(), ".ii", "cron-jobs.json"), "utf-8"))
+  : [];
 
 const DURABLE_MAP_IMPORT = "../.ii/runtime/durable-map.mjs";
 
@@ -299,6 +440,61 @@ function createDurableMapTransformer(manifest, importPath) {
   };
 }
 
+function createCronJobTransformer(cronManifest) {
+  return (context) => (sourceFile) => {
+    const entry = cronManifest.find((e) => {
+      const jsName = e.file.replace(/\\.ts$/, ".js").replace(/\\.mts$/, ".mjs");
+      return sourceFile.fileName.endsWith(e.file) || sourceFile.fileName.endsWith(jsName);
+    });
+
+    if (!entry || entry.jobs.length === 0) return sourceFile;
+
+    const endpoints = new Set(entry.jobs.map((j) => j.endpoint));
+
+    const visitor = (node) => {
+      if (
+        ts.isExpressionStatement(node) &&
+        node.parent === sourceFile &&
+        ts.isCallExpression(node.expression) &&
+        ts.isIdentifier(node.expression.expression) &&
+        node.expression.expression.text === "setInterval" &&
+        node.expression.arguments.length >= 2
+      ) {
+        const callback = node.expression.arguments[0];
+        if (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)) {
+          const fetchEndpoint = extractFetchEndpoint(callback.body);
+          if (fetchEndpoint && endpoints.has(fetchEndpoint)) {
+            return context.factory.createEmptyStatement();
+          }
+        }
+      }
+      return ts.visitEachChild(node, visitor, context);
+    };
+
+    return ts.visitEachChild(sourceFile, visitor, context);
+  };
+}
+
+function extractFetchEndpoint(body) {
+  let callExpr = null;
+  if (ts.isBlock(body)) {
+    if (body.statements.length !== 1) return null;
+    const stmt = body.statements[0];
+    if (!ts.isExpressionStatement(stmt)) return null;
+    if (!ts.isCallExpression(stmt.expression)) return null;
+    callExpr = stmt.expression;
+  } else {
+    if (!ts.isCallExpression(body)) return null;
+    callExpr = body;
+  }
+  if (!ts.isIdentifier(callExpr.expression)) return null;
+  if (callExpr.expression.text !== "fetch") return null;
+  if (callExpr.arguments.length < 1) return null;
+  const urlArg = callExpr.arguments[0];
+  if (!ts.isStringLiteral(urlArg)) return null;
+  return urlArg.text;
+}
+
 // Read tsconfig.json
 const configPath = ts.findConfigFile(process.cwd(), ts.sys.fileExists, "tsconfig.json");
 if (!configPath) {
@@ -311,10 +507,17 @@ const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, pr
 parsedConfig.options.outDir = "dist";
 
 const program = ts.createProgram(parsedConfig.fileNames, parsedConfig.options);
-const transformer = createDurableMapTransformer(manifest, DURABLE_MAP_IMPORT);
+
+const transformers = [];
+if (manifest.length > 0) {
+  transformers.push(createDurableMapTransformer(manifest, DURABLE_MAP_IMPORT));
+}
+if (cronManifest.length > 0) {
+  transformers.push(createCronJobTransformer(cronManifest));
+}
 
 const emitResult = program.emit(undefined, undefined, undefined, false, {
-  before: [transformer],
+  before: transformers,
 });
 
 const diagnostics = ts.getPreEmitDiagnostics(program).concat(emitResult.diagnostics);
@@ -461,6 +664,29 @@ if (addr && token && secretNames.length > 0) {
     }
   }
 }
+`);
+}
+
+/**
+ * Write .ii/components/statestore.yaml — Dapr state store component backed
+ * by SQLite. Used by the cron shim to persist registered job names across
+ * restarts so it can reconcile stale jobs on the next deploy.
+ */
+function writeDaprComponents(out: string) {
+  const componentsDir = join(out, "components");
+  mkdirSync(componentsDir, { recursive: true });
+
+  writeFileSync(join(componentsDir, "statestore.yaml"), `\
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: ii-state
+spec:
+  type: state.sqlite
+  version: v1
+  metadata:
+  - name: connectionString
+    value: /state/ii-state.db
 `);
 }
 
