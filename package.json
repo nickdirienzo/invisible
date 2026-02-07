@@ -10,12 +10,14 @@
     "ii": "./bin/ii.js"
   },
   "scripts": {
-    "test": "node --experimental-vm-modules node_modules/.bin/vitest run",
+    "test": "node --experimental-vm-modules node_modules/.bin/vitest run --exclude '**/*.integration.test.ts'",
+    "test:integration": "node --experimental-vm-modules node_modules/.bin/vitest run --config vitest.integration.config.ts",
     "build": "tsc",
     "ii": "tsx src/cli.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "testcontainers": "^11.11.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
