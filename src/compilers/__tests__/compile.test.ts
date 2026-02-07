@@ -533,12 +533,13 @@ describe("compileToDockerfile with cron jobs", () => {
     expect(dockerfile).not.toContain("cron-shim.mjs");
   });
 
-  it("copies cron-jobs.json in build stage for transformer", () => {
+  it("copies resources.json and build.mjs in build stage for transformer", () => {
     const dockerfile = compileToDockerfile(cronApp.services[0], "node index.js", {
       hasCronJobs: true,
     });
-    expect(dockerfile).toContain("cron-jobs.json");
+    expect(dockerfile).toContain("resources.json");
     expect(dockerfile).toContain("build.mjs");
+    expect(dockerfile).toContain("II_SERVICE=web");
   });
 
   it("copies runtime dir for II server", () => {
@@ -686,12 +687,13 @@ describe("compileToDockerfile with events", () => {
     expect(dockerfile).toContain("ii-server.mjs");
   });
 
-  it("copies events.json in build stage", () => {
+  it("copies resources.json and build.mjs in build stage", () => {
     const dockerfile = compileToDockerfile(eventsApp.services[0], "node index.js", {
       hasEvents: true,
     });
-    expect(dockerfile).toContain("events.json");
+    expect(dockerfile).toContain("resources.json");
     expect(dockerfile).toContain("build.mjs");
+    expect(dockerfile).toContain("II_SERVICE=web");
   });
 
   it("copies runtime dir", () => {

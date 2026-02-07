@@ -170,7 +170,9 @@ export function compileToCompose(app: App): string {
   if (appHasMaps || appHasEvents) {
     compose.services.valkey = {
       image: "valkey/valkey:8-alpine",
+      command: ["valkey-server", "--appendonly", "yes"],
       ports: ["6379:6379"],
+      volumes: ["valkey-data:/data"],
     };
   }
 
@@ -196,8 +198,11 @@ export function compileToCompose(app: App): string {
     };
   }
 
-  if (appHasCron) {
-    compose.volumes = { "dapr-state": {} };
+  const volumes: Record<string, Record<string, never>> = {};
+  if (appHasMaps || appHasEvents) volumes["valkey-data"] = {};
+  if (appHasCron) volumes["dapr-state"] = {};
+  if (Object.keys(volumes).length > 0) {
+    compose.volumes = volumes;
   }
 
   return stringify(compose);

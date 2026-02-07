@@ -13,11 +13,12 @@ const PLAN_FILE = "plan.json";
 const RESOURCES_FILE = "resources.json";
 
 const USAGE = `Usage:
-  ii plan                        <project-dir>   Analyze source, write .ii/${PLAN_FILE}
-  ii deploy --local              <project-dir>   Deploy locally via Docker
-  ii deploy --k8s                <project-dir>   Compile to k8s manifests
-  ii deploy --local --plan FILE  <project-dir>   Deploy using an existing plan file
-  ii deploy --k8s   --plan FILE  <project-dir>   Compile to k8s using an existing plan file`;
+  ii plan             [project-dir]   Analyze source, write .ii/${PLAN_FILE}
+  ii local up         [project-dir]   Build and start locally via Docker Compose
+  ii local down       [project-dir]   Stop and remove local containers
+  ii local logs       [project-dir]   Stream app service logs
+  ii deploy --k8s     [project-dir]   Compile to Kubernetes manifests
+  ii deploy --k8s --plan FILE [dir]   Compile to k8s using an existing plan file`;
 
 interface DeployOpts {
   target: string;
@@ -59,6 +60,20 @@ async function main() {
   if (command === "plan") {
     const projectDir = resolve(args[1] ?? ".");
     doPlan(projectDir);
+  } else if (command === "local") {
+    const subcommand = args[1];
+    const projectDir = resolve(args[2] ?? ".");
+    if (subcommand === "up") {
+      await doDeployLocal({ target: "--local", planFile: null, projectDir });
+    } else if (subcommand === "down") {
+      doLocalDown(projectDir);
+    } else if (subcommand === "logs") {
+      await doLocalLogs(projectDir);
+    } else {
+      console.error(`local requires 'up', 'down', or 'logs'\n`);
+      console.error(USAGE);
+      process.exit(1);
+    }
   } else if (command === "deploy") {
     const opts = parseDeployArgs(args.slice(1));
 
@@ -67,7 +82,7 @@ async function main() {
     } else if (opts.target === "--k8s") {
       doDeployK8s(opts);
     } else {
-      console.error(`Deploy requires --local or --k8s\n`);
+      console.error(`Deploy requires --k8s\n`);
       console.error(USAGE);
       process.exit(1);
     }
@@ -167,66 +182,69 @@ function loadOrPlan(projectDir: string, planFile: string | null): App {
   return app;
 }
 
+/**
+ * Write .ii/resources.json — a single manifest keyed by service name.
+ * Each service entry contains maps, cronJobs, and events arrays with
+ * file paths relative to the service's build context. The build script
+ * reads II_SERVICE (a Docker build ARG) to select the right section.
+ *
+ * Shape:
+ * {
+ *   "api": {
+ *     "maps": [{ "file": "index.ts", "varName": "tasks", "hashKey": "..." }],
+ *     "cronJobs": [{ "file": "index.ts", "endpoint": "/api/cleanup", "name": "..." }],
+ *     "events": [{ "file": "index.ts", "varName": "taskEvents", "namespace": "..." }]
+ *   }
+ * }
+ */
 function writeResourceManifest(out: string, app: App) {
   if (!app.resources?.length) return;
 
-  const byFile = new Map<string, Array<{ varName: string; hashKey: string }>>();
-  for (const r of app.resources) {
-    if (r.kind === "durable-map") {
-      const maps = byFile.get(r.sourceFile) ?? [];
-      maps.push({
-        varName: r.name,
-        hashKey: `${app.name}:${r.sourceFile}:${r.name}`,
-      });
-      byFile.set(r.sourceFile, maps);
-    }
-  }
+  const isMultiService = app.services.length > 1;
+  const manifest: Record<string, {
+    maps: Array<{ file: string; varName: string; hashKey: string }>;
+    cronJobs: Array<{ file: string; endpoint: string; name: string }>;
+    events: Array<{ file: string; varName: string; namespace: string }>;
+  }> = {};
 
-  const manifest = Array.from(byFile.entries()).map(([file, maps]) => ({
-    file,
-    maps,
-  }));
+  for (const svc of app.services) {
+    const svcResources = (app.resources ?? []).filter((r) =>
+      resourceBelongsToService(r, svc, isMultiService)
+    );
+    if (svcResources.length === 0) continue;
+
+    const prefix = svc.build.replace(/^\.\//, "");
+    const stripPrefix = (file: string) =>
+      prefix && file.startsWith(prefix + "/") ? file.slice(prefix.length + 1) : file;
+
+    const entry = { maps: [] as typeof manifest[string]["maps"], cronJobs: [] as typeof manifest[string]["cronJobs"], events: [] as typeof manifest[string]["events"] };
+
+    for (const r of svcResources) {
+      if (r.kind === "durable-map") {
+        entry.maps.push({
+          file: stripPrefix(r.sourceFile),
+          varName: r.name,
+          hashKey: `${app.name}:${r.sourceFile}:${r.name}`,
+        });
+      } else if (r.kind === "cron-job") {
+        entry.cronJobs.push({
+          file: stripPrefix(r.sourceFile),
+          endpoint: r.endpoint,
+          name: r.name,
+        });
+      } else if (r.kind === "event-emitter") {
+        entry.events.push({
+          file: stripPrefix(r.sourceFile),
+          varName: r.name,
+          namespace: r.name,
+        });
+      }
+    }
+
+    manifest[svc.name] = entry;
+  }
 
   writeFileSync(join(out, RESOURCES_FILE), JSON.stringify(manifest, null, 2) + "\n");
-
-  // Write cron jobs manifest for the transformer
-  const cronByFile = new Map<string, Array<{ endpoint: string; name: string }>>();
-  for (const r of app.resources) {
-    if (r.kind === "cron-job") {
-      const jobs = cronByFile.get(r.sourceFile) ?? [];
-      jobs.push({ endpoint: r.endpoint, name: r.name });
-      cronByFile.set(r.sourceFile, jobs);
-    }
-  }
-
-  if (cronByFile.size > 0) {
-    const cronManifest = Array.from(cronByFile.entries()).map(([file, jobs]) => ({
-      file,
-      jobs,
-    }));
-    writeFileSync(join(out, "cron-jobs.json"), JSON.stringify(cronManifest, null, 2) + "\n");
-  }
-
-  // Write events manifest for the transformer
-  const eventsByFile = new Map<string, Array<{ varName: string; namespace: string }>>();
-  for (const r of app.resources) {
-    if (r.kind === "event-emitter") {
-      const emitters = eventsByFile.get(r.sourceFile) ?? [];
-      emitters.push({
-        varName: r.name,
-        namespace: r.name,
-      });
-      eventsByFile.set(r.sourceFile, emitters);
-    }
-  }
-
-  if (eventsByFile.size > 0) {
-    const eventsManifest = Array.from(eventsByFile.entries()).map(([file, emitters]) => ({
-      file,
-      emitters,
-    }));
-    writeFileSync(join(out, "events.json"), JSON.stringify(eventsManifest, null, 2) + "\n");
-  }
 }
 
 function resourceBelongsToService(r: import("./ir/index.js").Resource, svc: import("./ir/index.js").Service, isMultiService: boolean): boolean {
@@ -297,8 +315,8 @@ async function doDeployLocal({ projectDir, planFile }: DeployOpts) {
 
   console.log(`${app.name}: deploying ${app.services.length} service(s) locally...\n`);
 
-  // Start everything in detached mode
-  execSync(`docker compose -f ${II_DIR}/docker-compose.yml up -d --build`, {
+  // Start everything in detached mode (project name scoped to app)
+  execSync(`docker compose -p ${app.name} -f ${II_DIR}/docker-compose.yml up -d --build`, {
     cwd: projectDir,
     stdio: "inherit",
   });
@@ -311,16 +329,49 @@ async function doDeployLocal({ projectDir, planFile }: DeployOpts) {
     await reconcileCronJobs(cronJobs);
   }
 
-  // Stream only the web service logs — infrastructure services (valkey, openbao, dapr)
-  // are implementation details the developer shouldn't need to see.
+  // Print service URLs
+  for (const svc of app.services) {
+    if (svc.ingress?.length) {
+      console.log(`  ${svc.name}: http://localhost:${svc.port}`);
+    }
+  }
+  console.log(`\nRun 'ii local logs' to stream logs, 'ii local down' to stop.`);
+}
+
+function doLocalDown(projectDir: string) {
+  const planPath = join(projectDir, II_DIR, PLAN_FILE);
+  let app: App;
+  try {
+    app = JSON.parse(readFileSync(planPath, "utf-8")) as App;
+  } catch {
+    console.error(`No plan found at ${II_DIR}/${PLAN_FILE} — run 'ii local up' first.`);
+    process.exit(1);
+  }
+
+  execSync(`docker compose -p ${app.name} -f ${II_DIR}/docker-compose.yml down`, {
+    cwd: projectDir,
+    stdio: "inherit",
+  });
+}
+
+async function doLocalLogs(projectDir: string) {
+  const planPath = join(projectDir, II_DIR, PLAN_FILE);
+  let app: App;
+  try {
+    app = JSON.parse(readFileSync(planPath, "utf-8")) as App;
+  } catch {
+    console.error(`No plan found at ${II_DIR}/${PLAN_FILE} — run 'ii local up' first.`);
+    process.exit(1);
+  }
+
+  // Stream only app service logs, not infrastructure (valkey, openbao, dapr)
   const serviceNames = app.services.map((s) => s.name);
   const logs = spawn(
-    "docker", ["compose", "-f", `${II_DIR}/docker-compose.yml`, "logs", "-f", ...serviceNames],
+    "docker", ["compose", "-p", app.name, "-f", `${II_DIR}/docker-compose.yml`, "logs", "-f", ...serviceNames],
     { cwd: projectDir, stdio: "inherit" }
   );
 
   process.on("SIGINT", () => logs.kill("SIGINT"));
-
   await new Promise<void>((res) => logs.on("close", () => res()));
 }
 
@@ -480,17 +531,27 @@ import ts from "typescript";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
-const manifest = existsSync(join(process.cwd(), ".ii", "resources.json"))
+// Read the service-keyed manifest and extract arrays for this service
+const serviceName = process.env.II_SERVICE;
+const allResources = existsSync(join(process.cwd(), ".ii", "resources.json"))
   ? JSON.parse(readFileSync(join(process.cwd(), ".ii", "resources.json"), "utf-8"))
-  : [];
+  : {};
+const svcResources = serviceName ? (allResources[serviceName] ?? {}) : {};
 
-const cronManifest = existsSync(join(process.cwd(), ".ii", "cron-jobs.json"))
-  ? JSON.parse(readFileSync(join(process.cwd(), ".ii", "cron-jobs.json"), "utf-8"))
-  : [];
+// Group flat resource arrays by file into the shape each transformer expects
+function groupByFile(items, key) {
+  const byFile = new Map();
+  for (const { file, ...rest } of items) {
+    const arr = byFile.get(file) ?? [];
+    arr.push(rest);
+    byFile.set(file, arr);
+  }
+  return Array.from(byFile.entries()).map(([file, values]) => ({ file, [key]: values }));
+}
 
-const eventsManifest = existsSync(join(process.cwd(), ".ii", "events.json"))
-  ? JSON.parse(readFileSync(join(process.cwd(), ".ii", "events.json"), "utf-8"))
-  : [];
+const manifest = groupByFile(svcResources.maps ?? [], "maps");
+const cronManifest = groupByFile(svcResources.cronJobs ?? [], "jobs");
+const eventsManifest = groupByFile(svcResources.events ?? [], "emitters");
 
 const DURABLE_MAP_IMPORT = "../.ii/runtime/durable-map.mjs";
 const DISTRIBUTED_EVENTS_IMPORT = "../.ii/runtime/distributed-events.mjs";
@@ -807,13 +868,15 @@ export class DurableMap {
   async values() {
     const c = await getClient();
     const all = await c.hgetall(this.#hashKey);
-    return Object.values(all).map((v) => JSON.parse(v));
+    // valkey-glide returns GlideRecord: array of { field, value } objects
+    return all.map((entry) => JSON.parse(entry.value));
   }
 
   async entries() {
     const c = await getClient();
     const all = await c.hgetall(this.#hashKey);
-    return Object.entries(all).map(([k, v]) => [k, JSON.parse(v)]);
+    // valkey-glide returns GlideRecord: array of { field, value } objects
+    return all.map((entry) => [entry.field, JSON.parse(entry.value)]);
   }
 }
 `);
