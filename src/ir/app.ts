@@ -50,4 +50,11 @@ export interface CronJobResource {
   sourceFile: string;
 }
 
-export type Resource = DurableMapResource | SecretResource | CronJobResource;
+export interface EventEmitterResource {
+  kind: "event-emitter";
+  name: string;
+  sourceFile: string;
+  events: string[];
+}
+
+export type Resource = DurableMapResource | SecretResource | CronJobResource | EventEmitterResource;

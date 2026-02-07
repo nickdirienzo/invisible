@@ -33,7 +33,7 @@ describe("detectCronJobs", () => {
     expect(cronJobs).toHaveLength(1);
     expect(cronJobs[0]).toEqual({
       kind: "cron-job",
-      name: "report",
+      name: "job-report",
       endpoint: "/job/report",
       method: "GET",
       intervalMs: 86400000,
@@ -126,7 +126,7 @@ describe("detectCronJobs", () => {
     expect(cronJobs).toHaveLength(0);
   });
 
-  it("ignores fetch to non /job/* routes", () => {
+  it("detects fetch to any local path (no /job/ restriction)", () => {
     const dir = makeProject({
       "index.ts": `
         import express from "express";
@@ -137,7 +137,31 @@ describe("detectCronJobs", () => {
     });
     const result = plan(dir);
     const cronJobs = result.resources?.filter((r) => r.kind === "cron-job") ?? [];
-    expect(cronJobs).toHaveLength(0);
+    expect(cronJobs).toHaveLength(1);
+    expect(cronJobs[0]).toMatchObject({
+      kind: "cron-job",
+      name: "api-report",
+      endpoint: "/api/report",
+    });
+  });
+
+  it("detects simple root-level path", () => {
+    const dir = makeProject({
+      "index.ts": `
+        import express from "express";
+        const app = express();
+        setInterval(() => fetch('/cleanup'), 3600000);
+        app.listen(3000);
+      `,
+    });
+    const result = plan(dir);
+    const cronJobs = result.resources?.filter((r) => r.kind === "cron-job") ?? [];
+    expect(cronJobs).toHaveLength(1);
+    expect(cronJobs[0]).toMatchObject({
+      kind: "cron-job",
+      name: "cleanup",
+      endpoint: "/cleanup",
+    });
   });
 
   it("ignores external URLs", () => {
@@ -205,7 +229,7 @@ describe("detectCronJobs", () => {
     expect(cronJobs).toHaveLength(0);
   });
 
-  it("derives job name from path after /job/", () => {
+  it("derives job name from full path", () => {
     const dir = makeProject({
       "index.ts": `
         import express from "express";
@@ -218,7 +242,24 @@ describe("detectCronJobs", () => {
     const cronJobs = result.resources?.filter((r) => r.kind === "cron-job") ?? [];
     expect(cronJobs).toHaveLength(1);
     if (cronJobs[0].kind === "cron-job") {
-      expect(cronJobs[0].name).toBe("daily-report");
+      expect(cronJobs[0].name).toBe("job-daily-report");
+    }
+  });
+
+  it("derives job name from multi-segment path", () => {
+    const dir = makeProject({
+      "index.ts": `
+        import express from "express";
+        const app = express();
+        setInterval(() => fetch('/api/daily-report'), 86400000);
+        app.listen(3000);
+      `,
+    });
+    const result = plan(dir);
+    const cronJobs = result.resources?.filter((r) => r.kind === "cron-job") ?? [];
+    expect(cronJobs).toHaveLength(1);
+    if (cronJobs[0].kind === "cron-job") {
+      expect(cronJobs[0].name).toBe("api-daily-report");
     }
   });
 
