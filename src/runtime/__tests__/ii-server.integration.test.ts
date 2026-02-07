@@ -57,6 +57,7 @@ describe("II Server Integration", { timeout: 120_000 }, () => {
       .start();
 
     // 5. Import II server (starts listening on iiServerPort)
+    // @ts-expect-error — runtime .mjs with no declaration file
     await import("../ii-server.mjs");
 
     // 6. Start mock app server (for cron job proxying)
@@ -113,6 +114,7 @@ spec:
     process.env.DAPR_HTTP_PORT = String(daprHttpPort);
 
     // 10. Import DistributedEventEmitter
+    // @ts-expect-error — runtime .mjs with no declaration file
     await import("../distributed-events.mjs");
 
     // Give Dapr a moment to discover subscriptions
@@ -151,6 +153,7 @@ spec:
   });
 
   it("POST /ii/events delivers to handler directly", async () => {
+    // @ts-expect-error — runtime .mjs with no declaration file
     const { DistributedEventEmitter } = await import("../distributed-events.mjs");
     const emitter = new DistributedEventEmitter("orders");
 
@@ -182,6 +185,7 @@ spec:
   });
 
   it("full pub/sub round-trip through Dapr", async () => {
+    // @ts-expect-error — runtime .mjs with no declaration file
     const { DistributedEventEmitter } = await import("../distributed-events.mjs");
     const emitter = new DistributedEventEmitter("orders");
 
@@ -201,6 +205,7 @@ spec:
   });
 
   it("once() handler fires exactly once", async () => {
+    // @ts-expect-error — runtime .mjs with no declaration file
     const { DistributedEventEmitter } = await import("../distributed-events.mjs");
     const emitter = new DistributedEventEmitter("orders");
 

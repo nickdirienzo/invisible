@@ -229,26 +229,48 @@ function writeResourceManifest(out: string, app: App) {
   }
 }
 
+function resourceBelongsToService(r: import("./ir/index.js").Resource, svc: import("./ir/index.js").Service, isMultiService: boolean): boolean {
+  if (!isMultiService) return true;
+  const prefix = svc.build.replace(/^\.\//, "");
+  return r.sourceFile.startsWith(prefix + "/");
+}
+
 async function doDeployLocal({ projectDir, planFile }: DeployOpts) {
   const app = loadOrPlan(projectDir, planFile);
-  const startCmd = getStartCmd(projectDir);
-  const svc = app.services[0];
   const out = iiDir(projectDir);
+  const isMultiService = app.services.length > 1;
+
+  // App-level resource flags for shared infrastructure
   const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
   const hasSecretResources = app.resources?.some((r) => r.kind === "secret") ?? false;
   const hasCron = app.resources?.some((r) => r.kind === "cron-job") ?? false;
   const hasEvents = app.resources?.some((r) => r.kind === "event-emitter") ?? false;
   const hasDapr = hasCron || hasEvents;
 
-  writeFileSync(
-    join(out, "Dockerfile"),
-    compileToDockerfile(svc, startCmd, {
-      hasResources: hasMaps,
-      hasSecrets: hasSecretResources,
-      hasCronJobs: hasCron,
-      hasEvents,
-    })
-  );
+  // Generate a Dockerfile per service
+  for (const svc of app.services) {
+    const svcDir = isMultiService
+      ? join(projectDir, svc.build.replace(/^\.\//, ""))
+      : projectDir;
+    const startCmd = getStartCmd(svcDir);
+    const svcResources = (app.resources ?? []).filter((r) => resourceBelongsToService(r, svc, isMultiService));
+    const svcHasMaps = svcResources.some((r) => r.kind === "durable-map");
+    const svcHasSecrets = svcResources.some((r) => r.kind === "secret");
+    const svcHasCron = svcResources.some((r) => r.kind === "cron-job");
+    const svcHasEvents = svcResources.some((r) => r.kind === "event-emitter");
+
+    const dockerfileName = isMultiService ? `Dockerfile.${svc.name}` : "Dockerfile";
+    writeFileSync(
+      join(out, dockerfileName),
+      compileToDockerfile(svc, startCmd, {
+        hasResources: svcHasMaps,
+        hasSecrets: svcHasSecrets,
+        hasCronJobs: svcHasCron,
+        hasEvents: svcHasEvents,
+      })
+    );
+  }
+
   writeFileSync(join(out, "Dockerfile.dockerignore"), "node_modules\n");
   writeFileSync(join(out, "docker-compose.yml"), compileToCompose(app));
 
@@ -378,24 +400,41 @@ async function reconcileCronJobs(
 
 function doDeployK8s({ projectDir, planFile }: DeployOpts) {
   const app = loadOrPlan(projectDir, planFile);
-  const startCmd = getStartCmd(projectDir);
-  const svc = app.services[0];
   const out = iiDir(projectDir);
+  const isMultiService = app.services.length > 1;
+
   const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
   const hasSecretResources = app.resources?.some((r) => r.kind === "secret") ?? false;
   const hasCron = app.resources?.some((r) => r.kind === "cron-job") ?? false;
   const hasEvents = app.resources?.some((r) => r.kind === "event-emitter") ?? false;
   const hasDapr = hasCron || hasEvents;
 
-  writeFileSync(
-    join(out, "Dockerfile"),
-    compileToDockerfile(svc, startCmd, {
-      hasResources: hasMaps,
-      hasSecrets: hasSecretResources,
-      hasCronJobs: hasCron,
-      hasEvents,
-    })
-  );
+  // Generate a Dockerfile per service
+  const dockerfileNames: string[] = [];
+  for (const svc of app.services) {
+    const svcDir = isMultiService
+      ? join(projectDir, svc.build.replace(/^\.\//, ""))
+      : projectDir;
+    const startCmd = getStartCmd(svcDir);
+    const svcResources = (app.resources ?? []).filter((r) => resourceBelongsToService(r, svc, isMultiService));
+    const svcHasMaps = svcResources.some((r) => r.kind === "durable-map");
+    const svcHasSecrets = svcResources.some((r) => r.kind === "secret");
+    const svcHasCron = svcResources.some((r) => r.kind === "cron-job");
+    const svcHasEvents = svcResources.some((r) => r.kind === "event-emitter");
+
+    const dockerfileName = isMultiService ? `Dockerfile.${svc.name}` : "Dockerfile";
+    dockerfileNames.push(dockerfileName);
+    writeFileSync(
+      join(out, dockerfileName),
+      compileToDockerfile(svc, startCmd, {
+        hasResources: svcHasMaps,
+        hasSecrets: svcHasSecrets,
+        hasCronJobs: svcHasCron,
+        hasEvents: svcHasEvents,
+      })
+    );
+  }
+
   writeFileSync(join(out, "Dockerfile.dockerignore"), "node_modules\n");
   writeFileSync(join(out, "k8s.yml"), compileToK8s(app));
 
@@ -421,7 +460,9 @@ function doDeployK8s({ projectDir, planFile }: DeployOpts) {
   }
 
   console.log(`${app.name}: compiled ${app.services.length} service(s)\n`);
-  console.log(`  ${II_DIR}/Dockerfile`);
+  for (const name of dockerfileNames) {
+    console.log(`  ${II_DIR}/${name}`);
+  }
   console.log(`  ${II_DIR}/k8s.yml`);
 }
 

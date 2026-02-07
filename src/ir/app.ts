@@ -17,6 +17,8 @@ export interface Service {
   startCmd?: string;
   /** When set, the build uses this command instead of tsc (e.g. "remix vite:build") */
   buildCmd?: string;
+  /** When true, the service is a static site served by nginx (no server process) */
+  static?: boolean;
 }
 
 export interface IngressRule {

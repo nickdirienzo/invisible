@@ -22,15 +22,37 @@ export function compileToDockerfile(
   const hasEvents = !!options?.hasEvents;
   const hasDapr = hasCronJobs || hasEvents;
 
+  // Build path prefix for monorepo services (e.g. "./api" → "api/")
+  const buildDir = svc.build === "./" ? "" : svc.build.replace(/^\.\//, "") + "/";
+  // Monorepo: copy service package.json + root lockfile. Single-service: copy both from root.
+  const copyPkg = buildDir
+    ? `COPY ${buildDir}package.json package-lock.json ./`
+    : "COPY package.json package-lock.json ./";
+  const copySrc = buildDir ? `COPY ${buildDir} .` : "COPY . .";
+
+  // Static sites (Vite, CRA, etc.) — build to static files, serve with nginx
+  if (svc.static && svc.buildCmd) {
+    return `FROM node:22-slim AS build
+WORKDIR /app
+${copyPkg}
+RUN npm ci
+${copySrc}
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+`;
+  }
+
   // Framework apps (Remix, Next, etc.) — use the framework's own build & start
   if (svc.startCmd && svc.buildCmd) {
     return `FROM node:22-slim
 WORKDIR /app
-COPY package.json package-lock.json ./
+${copyPkg}
 RUN npm ci
-COPY . .
+${copySrc}
 RUN npm run build
-RUN npm prune --omit=dev
 EXPOSE ${svc.port}
 CMD ["npm", "run", "start"]
 `;
@@ -72,14 +94,14 @@ CMD ["npm", "run", "start"]
 
     return `FROM node:22-slim AS build
 WORKDIR /app
-COPY package.json package-lock.json ./
+${copyPkg}
 RUN npm ci && npm ls typescript >/dev/null 2>&1 || npm install --no-save typescript
-COPY . .
+${copySrc}
 ${buildCmd}
 
 FROM node:22-slim
 WORKDIR /app
-COPY package.json package-lock.json ./
+${copyPkg}
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 ${runtimeLines}EXPOSE ${svc.port}
@@ -92,9 +114,9 @@ ${cmd}
   // (runtime loader), but for now this only supports TypeScript
   return `FROM node:22-slim
 WORKDIR /app
-COPY package.json package-lock.json ./
+${copyPkg}
 RUN npm ci --omit=dev
-COPY . .
+${copySrc}
 EXPOSE ${svc.port}
 CMD ${JSON.stringify(startCmd.split(" "))}
 `;
