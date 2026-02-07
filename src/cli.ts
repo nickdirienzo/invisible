@@ -289,9 +289,11 @@ async function doDeployLocal({ projectDir, planFile }: DeployOpts) {
     await reconcileCronJobs(cronJobs);
   }
 
-  // Stream logs in foreground — Ctrl+C stops tailing but containers keep running
+  // Stream only the web service logs — infrastructure services (valkey, openbao, dapr)
+  // are implementation details the developer shouldn't need to see.
+  const serviceNames = app.services.map((s) => s.name);
   const logs = spawn(
-    "docker", ["compose", "-f", `${II_DIR}/docker-compose.yml`, "logs", "-f"],
+    "docker", ["compose", "-f", `${II_DIR}/docker-compose.yml`, "logs", "-f", ...serviceNames],
     { cwd: projectDir, stdio: "inherit" }
   );
 
