@@ -17,7 +17,7 @@ orders.on("order:shipped", (data) => {
   // In a real app: send shipping notification
 });
 
-orders.once("order:cancelled", (data) => {
+orders.on("order:cancelled", (data) => {
   console.log(`Order cancelled: ${JSON.stringify(data)}`);
 });
 
