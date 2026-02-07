@@ -33,31 +33,38 @@ setInterval(() => {
 }, 24 * 60 * 60 * 1000);
 
 app.use(express.json());
+app.use((_req, res, next) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+  if (_req.method === "OPTIONS") { res.sendStatus(204); return; }
+  next();
+});
 
 // Board endpoints
 app.post("/api/boards", async (req, res) => {
   const id = crypto.randomUUID();
   const board = { name: req.body.name, createdAt: new Date().toISOString() };
-  boards.set(id, board);
+  await boards.set(id, board);
   res.json({ id, ...board });
 });
 
 app.get("/api/boards", async (_req, res) => {
   const result: Array<{ id: string; name: string; createdAt: string }> = [];
-  boards.forEach((board, id) => {
+  for (const [id, board] of await boards.entries()) {
     result.push({ id, ...board });
-  });
+  }
   res.json(result);
 });
 
 // Task endpoints
 app.get("/api/boards/:boardId/tasks", async (req, res) => {
   const result: Array<{ id: string; title: string; column: string; boardId: string; createdAt: string }> = [];
-  tasks.forEach((task, id) => {
+  for (const [id, task] of await tasks.entries()) {
     if (task.boardId === req.params.boardId) {
       result.push({ id, ...task });
     }
-  });
+  }
   res.json(result);
 });
 
@@ -69,13 +76,13 @@ app.post("/api/boards/:boardId/tasks", async (req, res) => {
     boardId: req.params.boardId,
     createdAt: new Date().toISOString(),
   };
-  tasks.set(id, task);
+  await tasks.set(id, task);
   taskEvents.emit("task:created", { id, ...task });
   res.json({ id, ...task });
 });
 
 app.patch("/api/tasks/:taskId", async (req, res) => {
-  const task = tasks.get(req.params.taskId);
+  const task = await tasks.get(req.params.taskId);
   if (!task) {
     res.status(404).json({ error: "not found" });
     return;
@@ -83,7 +90,7 @@ app.patch("/api/tasks/:taskId", async (req, res) => {
 
   const prevColumn = task.column;
   const updated = { ...task, ...req.body };
-  tasks.set(req.params.taskId, updated);
+  await tasks.set(req.params.taskId, updated);
 
   if (updated.column === "done" && prevColumn !== "done") {
     taskEvents.emit("task:completed", { id: req.params.taskId, ...updated });
@@ -95,22 +102,22 @@ app.patch("/api/tasks/:taskId", async (req, res) => {
 });
 
 app.delete("/api/tasks/:taskId", async (req, res) => {
-  const deleted = tasks.delete(req.params.taskId);
+  const deleted = await tasks.delete(req.params.taskId);
   res.json({ deleted });
 });
 
 // Cleanup endpoint (called by cron job)
 app.post("/api/cleanup", async (_req, res) => {
   let archived = 0;
-  tasks.forEach((task, id) => {
+  for (const [id, task] of await tasks.entries()) {
     if (task.column === "done") {
       const age = Date.now() - new Date(task.createdAt).getTime();
       if (age > 30 * 24 * 60 * 60 * 1000) {
-        tasks.delete(id);
+        await tasks.delete(id);
         archived++;
       }
     }
-  });
+  }
   console.log(`Cleanup: archived ${archived} completed tasks`);
   res.json({ archived });
 });

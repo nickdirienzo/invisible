@@ -14,6 +14,7 @@ interface Board {
   createdAt: string;
 }
 
+const API = import.meta.env.VITE_API_URL ?? "";
 const COLUMNS = ["todo", "in-progress", "done"] as const;
 
 export function App() {
@@ -24,21 +25,21 @@ export function App() {
   const [newTaskTitle, setNewTaskTitle] = useState("");
 
   useEffect(() => {
-    fetch("/api/boards")
+    fetch(`${API}/api/boards`)
       .then((r) => r.json())
       .then(setBoards);
   }, []);
 
   useEffect(() => {
     if (!selectedBoard) return;
-    fetch(`/api/boards/${selectedBoard}/tasks`)
+    fetch(`${API}/api/boards/${selectedBoard}/tasks`)
       .then((r) => r.json())
       .then(setTasks);
   }, [selectedBoard]);
 
   async function createBoard() {
     if (!newBoardName.trim()) return;
-    const res = await fetch("/api/boards", {
+    const res = await fetch(`${API}/api/boards`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: newBoardName }),
@@ -51,7 +52,7 @@ export function App() {
 
   async function createTask() {
     if (!newTaskTitle.trim() || !selectedBoard) return;
-    const res = await fetch(`/api/boards/${selectedBoard}/tasks`, {
+    const res = await fetch(`${API}/api/boards/${selectedBoard}/tasks`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: newTaskTitle }),
@@ -62,7 +63,7 @@ export function App() {
   }
 
   async function moveTask(taskId: string, column: string) {
-    const res = await fetch(`/api/tasks/${taskId}`, {
+    const res = await fetch(`${API}/api/tasks/${taskId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ column }),
@@ -72,7 +73,7 @@ export function App() {
   }
 
   async function deleteTask(taskId: string) {
-    await fetch(`/api/tasks/${taskId}`, { method: "DELETE" });
+    await fetch(`${API}/api/tasks/${taskId}`, { method: "DELETE" });
     setTasks((prev) => prev.filter((t) => t.id !== taskId));
   }
 
