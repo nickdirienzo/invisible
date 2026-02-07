@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { execSync, spawn } from "node:child_process";
 import { resolve, join } from "node:path";
 import type { App } from "./ir/index.js";
@@ -824,179 +825,15 @@ if (addr && token && secretNames.length > 0) {
 function writeIIServerRuntime(out: string) {
   const runtimeDir = join(out, "runtime");
   mkdirSync(runtimeDir, { recursive: true });
-
-  writeFileSync(join(runtimeDir, "ii-server.mjs"), `\
-// II internal server — runs via node --import before the app starts.
-// Provides HTTP endpoints for Dapr to deliver pub/sub messages and cron callbacks.
-// No monkey-patching — this is a standalone server on its own port.
-
-import http from "node:http";
-
-const II_PORT = parseInt(process.env.II_SERVER_PORT || "3501", 10);
-const APP_PORT = parseInt(process.env.II_APP_PORT || "3000", 10);
-const eventsManifest = JSON.parse(process.env.II_EVENTS_MANIFEST || "[]");
-
-function readBody(req) {
-  return new Promise((resolve) => {
-    let body = "";
-    req.on("data", (chunk) => { body += chunk; });
-    req.on("end", () => resolve(body));
-  });
-}
-
-const server = http.createServer(async (req, res) => {
-  // GET /dapr/subscribe — programmatic subscription list
-  if (req.method === "GET" && req.url === "/dapr/subscribe") {
-    const subs = [];
-    for (const entry of eventsManifest) {
-      for (const event of entry.events) {
-        subs.push({
-          pubsubname: "ii-pubsub",
-          topic: \`\${entry.namespace}.\${event}\`,
-          route: \`/ii/events/\${entry.namespace}/\${event}\`,
-        });
-      }
-    }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(subs));
-    return;
-  }
-
-  // POST /ii/events/{namespace}/{event} — pub/sub delivery
-  const eventsMatch = req.url?.match(/^\\/ii\\/events\\/([^/]+)\\/(.+)$/);
-  if (req.method === "POST" && eventsMatch) {
-    const [, namespace, event] = eventsMatch;
-    const body = await readBody(req);
-    try {
-      const envelope = JSON.parse(body);
-      // Dapr wraps pub/sub payloads in a CloudEvents envelope — unwrap .data
-      const payload = envelope.data ?? envelope;
-      for (const emitter of (globalThis.__ii_event_emitters || [])) {
-        if (emitter._namespace === namespace) {
-          emitter._deliver(event, payload);
-        }
-      }
-    } catch (err) {
-      console.error("[ii] Failed to deliver event:", err.message);
-    }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end('{"status":"ok"}');
-    return;
-  }
-
-  // POST /ii/jobs/{name} — cron job callback, proxy to app
-  const jobsMatch = req.url?.match(/^\\/ii\\/jobs\\/(.+)$/);
-  if (req.method === "POST" && jobsMatch) {
-    const body = await readBody(req);
-    try {
-      const data = JSON.parse(body);
-      const { endpoint, method } = data;
-      await fetch(\`http://localhost:\${APP_PORT}\${endpoint}\`, { method: method || "GET" });
-    } catch (err) {
-      console.error("[ii] Failed to proxy cron job:", err.message);
-    }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end('{"status":"ok"}');
-    return;
-  }
-
-  res.writeHead(404);
-  res.end("not found");
-});
-
-server.listen(II_PORT, () => {
-  console.log(\`[ii] Internal server listening on :\${II_PORT}\`);
-});
-`);
+  const src = fileURLToPath(new URL("./runtime/ii-server.mjs", import.meta.url));
+  copyFileSync(src, join(runtimeDir, "ii-server.mjs"));
 }
 
 function writeDistributedEventsRuntime(out: string) {
   const runtimeDir = join(out, "runtime");
   mkdirSync(runtimeDir, { recursive: true });
-
-  writeFileSync(join(runtimeDir, "distributed-events.mjs"), `\
-// Distributed EventEmitter — replaces node:events EventEmitter with Dapr pub/sub.
-// emit() publishes to Dapr, handlers are invoked when Dapr delivers messages
-// through the II internal server.
-
-const DAPR_PORT = process.env.DAPR_HTTP_PORT || "3500";
-const PUBSUB_NAME = "ii-pubsub";
-
-export class DistributedEventEmitter {
-  #namespace;
-  #handlers = new Map();
-
-  constructor(namespace) {
-    this.#namespace = namespace;
-    globalThis.__ii_event_emitters = globalThis.__ii_event_emitters || [];
-    globalThis.__ii_event_emitters.push(this);
-  }
-
-  on(event, handler) {
-    if (!this.#handlers.has(event)) {
-      this.#handlers.set(event, new Set());
-    }
-    this.#handlers.get(event).add(handler);
-    return this;
-  }
-
-  once(event, handler) {
-    const wrapper = (...args) => {
-      this.off(event, wrapper);
-      handler(...args);
-    };
-    wrapper._original = handler;
-    return this.on(event, wrapper);
-  }
-
-  off(event, handler) {
-    const set = this.#handlers.get(event);
-    if (set) {
-      set.delete(handler);
-      for (const h of set) {
-        if (h._original === handler) {
-          set.delete(h);
-          break;
-        }
-      }
-    }
-    return this;
-  }
-
-  removeListener(event, handler) {
-    return this.off(event, handler);
-  }
-
-  async emit(event, ...args) {
-    const topic = \`\${this.#namespace}.\${event}\`;
-    try {
-      await fetch(\`http://localhost:\${DAPR_PORT}/v1.0/publish/\${PUBSUB_NAME}/\${topic}\`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ args }),
-      });
-    } catch (err) {
-      console.error(\`[ii] Failed to publish to \${topic}:\`, err.message);
-    }
-    return true;
-  }
-
-  _deliver(event, data) {
-    const set = this.#handlers.get(event);
-    if (!set) return;
-    const args = data?.args ?? [];
-    for (const handler of set) {
-      try {
-        handler(...args);
-      } catch (err) {
-        console.error(\`[ii] Handler error for \${this.#namespace}.\${event}:\`, err);
-      }
-    }
-  }
-
-  get _namespace() { return this.#namespace; }
-}
-`);
+  const src = fileURLToPath(new URL("./runtime/distributed-events.mjs", import.meta.url));
+  copyFileSync(src, join(runtimeDir, "distributed-events.mjs"));
 }
 
 function writePubsubComponent(out: string) {
