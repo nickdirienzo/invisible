@@ -117,6 +117,39 @@ function doPlan(projectDir: string) {
         }
       }
     }
+
+    const eventEmitters = app.resources.filter((r) => r.kind === "event-emitter");
+    if (eventEmitters.length > 0) {
+      console.log(`\n  event emitters:`);
+      for (const r of eventEmitters) {
+        if (r.kind === "event-emitter") {
+          console.log(`    ${r.name} → ${r.events.join(", ")} (${r.sourceFile})`);
+        }
+      }
+    }
+  }
+
+  // Show inferred infrastructure
+  const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
+  const hasSecretResources = app.resources?.some((r) => r.kind === "secret") ?? false;
+  const hasCron = app.resources?.some((r) => r.kind === "cron-job") ?? false;
+  const hasEvents = app.resources?.some((r) => r.kind === "event-emitter") ?? false;
+  const hasDapr = hasCron || hasEvents;
+
+  const infra: string[] = [];
+  if (hasMaps || hasEvents) infra.push("valkey");
+  if (hasSecretResources) infra.push("openbao");
+  if (hasDapr) infra.push("dapr");
+
+  if (infra.length > 0) {
+    console.log(`\n  infrastructure:`);
+    if (hasMaps) console.log(`    valkey — durable map backend`);
+    if (hasEvents && !hasMaps) console.log(`    valkey — pub/sub backend`);
+    if (hasEvents && hasMaps) console.log(`           + pub/sub backend`);
+    if (hasSecretResources) console.log(`    openbao — secrets management`);
+    if (hasCron && hasEvents) console.log(`    dapr — job scheduling + pub/sub`);
+    else if (hasCron) console.log(`    dapr — job scheduling`);
+    else if (hasEvents) console.log(`    dapr — pub/sub`);
   }
 
   console.log(`\nPlan written to ${II_DIR}/${PLAN_FILE}`);
@@ -172,6 +205,27 @@ function writeResourceManifest(out: string, app: App) {
     }));
     writeFileSync(join(out, "cron-jobs.json"), JSON.stringify(cronManifest, null, 2) + "\n");
   }
+
+  // Write events manifest for the transformer
+  const eventsByFile = new Map<string, Array<{ varName: string; namespace: string }>>();
+  for (const r of app.resources) {
+    if (r.kind === "event-emitter") {
+      const emitters = eventsByFile.get(r.sourceFile) ?? [];
+      emitters.push({
+        varName: r.name,
+        namespace: r.name,
+      });
+      eventsByFile.set(r.sourceFile, emitters);
+    }
+  }
+
+  if (eventsByFile.size > 0) {
+    const eventsManifest = Array.from(eventsByFile.entries()).map(([file, emitters]) => ({
+      file,
+      emitters,
+    }));
+    writeFileSync(join(out, "events.json"), JSON.stringify(eventsManifest, null, 2) + "\n");
+  }
 }
 
 async function doDeployLocal({ projectDir, planFile }: DeployOpts) {
@@ -182,6 +236,8 @@ async function doDeployLocal({ projectDir, planFile }: DeployOpts) {
   const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
   const hasSecretResources = app.resources?.some((r) => r.kind === "secret") ?? false;
   const hasCron = app.resources?.some((r) => r.kind === "cron-job") ?? false;
+  const hasEvents = app.resources?.some((r) => r.kind === "event-emitter") ?? false;
+  const hasDapr = hasCron || hasEvents;
 
   writeFileSync(
     join(out, "Dockerfile"),
@@ -189,14 +245,23 @@ async function doDeployLocal({ projectDir, planFile }: DeployOpts) {
       hasResources: hasMaps,
       hasSecrets: hasSecretResources,
       hasCronJobs: hasCron,
+      hasEvents,
     })
   );
+  writeFileSync(join(out, "Dockerfile.dockerignore"), "node_modules\n");
   writeFileSync(join(out, "docker-compose.yml"), compileToCompose(app));
 
-  if (hasMaps || hasCron) {
+  if (hasMaps || hasCron || hasEvents) {
     writeResourceManifest(out, app);
     writeBuildScript(out, app);
     if (hasMaps) writeDurableMapRuntime(out);
+  }
+
+  if (hasDapr) writeIIServerRuntime(out);
+
+  if (hasEvents) {
+    writeDistributedEventsRuntime(out);
+    writePubsubComponent(out);
   }
 
   if (hasSecretResources) {
@@ -289,7 +354,7 @@ async function reconcileCronJobs(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           schedule: `@every ${job.intervalMs}ms`,
-          data: { jobName: job.name },
+          data: { endpoint: job.endpoint, method: job.method },
         }),
       });
       console.log(`  Registered cron job: ${job.name} (every ${job.intervalMs}ms)`);
@@ -316,6 +381,8 @@ function doDeployK8s({ projectDir, planFile }: DeployOpts) {
   const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
   const hasSecretResources = app.resources?.some((r) => r.kind === "secret") ?? false;
   const hasCron = app.resources?.some((r) => r.kind === "cron-job") ?? false;
+  const hasEvents = app.resources?.some((r) => r.kind === "event-emitter") ?? false;
+  const hasDapr = hasCron || hasEvents;
 
   writeFileSync(
     join(out, "Dockerfile"),
@@ -323,14 +390,23 @@ function doDeployK8s({ projectDir, planFile }: DeployOpts) {
       hasResources: hasMaps,
       hasSecrets: hasSecretResources,
       hasCronJobs: hasCron,
+      hasEvents,
     })
   );
+  writeFileSync(join(out, "Dockerfile.dockerignore"), "node_modules\n");
   writeFileSync(join(out, "k8s.yml"), compileToK8s(app));
 
-  if (hasMaps || hasCron) {
+  if (hasMaps || hasCron || hasEvents) {
     writeResourceManifest(out, app);
     writeBuildScript(out, app);
     if (hasMaps) writeDurableMapRuntime(out);
+  }
+
+  if (hasDapr) writeIIServerRuntime(out);
+
+  if (hasEvents) {
+    writeDistributedEventsRuntime(out);
+    writePubsubComponent(out);
   }
 
   if (hasSecretResources) {
@@ -368,7 +444,12 @@ const cronManifest = existsSync(join(process.cwd(), ".ii", "cron-jobs.json"))
   ? JSON.parse(readFileSync(join(process.cwd(), ".ii", "cron-jobs.json"), "utf-8"))
   : [];
 
+const eventsManifest = existsSync(join(process.cwd(), ".ii", "events.json"))
+  ? JSON.parse(readFileSync(join(process.cwd(), ".ii", "events.json"), "utf-8"))
+  : [];
+
 const DURABLE_MAP_IMPORT = "../.ii/runtime/durable-map.mjs";
+const DISTRIBUTED_EVENTS_IMPORT = "../.ii/runtime/distributed-events.mjs";
 
 function createDurableMapTransformer(manifest, importPath) {
   return (context) => (sourceFile) => {
@@ -495,6 +576,76 @@ function extractFetchEndpoint(body) {
   return urlArg.text;
 }
 
+function createEventEmitterTransformer(eventsManifest, importPath) {
+  return (context) => (sourceFile) => {
+    const entry = eventsManifest.find((e) => {
+      const jsName = e.file.replace(/\\.ts$/, ".js").replace(/\\.mts$/, ".mjs");
+      return sourceFile.fileName.endsWith(e.file) || sourceFile.fileName.endsWith(jsName);
+    });
+
+    if (!entry || entry.emitters.length === 0) return sourceFile;
+
+    const varNames = new Map(entry.emitters.map((em) => [em.varName, em.namespace]));
+    let needsImport = false;
+
+    const visitor = (node) => {
+      if (ts.isVariableStatement(node) && node.parent === sourceFile) {
+        const newDeclarations = node.declarationList.declarations.map((decl) => {
+          if (
+            decl.initializer &&
+            ts.isNewExpression(decl.initializer) &&
+            ts.isIdentifier(decl.initializer.expression) &&
+            decl.initializer.expression.text === "EventEmitter" &&
+            ts.isIdentifier(decl.name) &&
+            varNames.has(decl.name.text)
+          ) {
+            needsImport = true;
+            const namespace = varNames.get(decl.name.text);
+            const newExpr = context.factory.createNewExpression(
+              context.factory.createIdentifier("DistributedEventEmitter"),
+              undefined,
+              [context.factory.createStringLiteral(namespace)]
+            );
+            return context.factory.updateVariableDeclaration(
+              decl, decl.name, decl.exclamationToken, undefined, newExpr
+            );
+          }
+          return decl;
+        });
+
+        const newDeclList = context.factory.updateVariableDeclarationList(
+          node.declarationList, newDeclarations
+        );
+        return context.factory.updateVariableStatement(node, node.modifiers, newDeclList);
+      }
+      return ts.visitEachChild(node, visitor, context);
+    };
+
+    const transformed = ts.visitEachChild(sourceFile, visitor, context);
+    if (!needsImport) return transformed;
+
+    const importDecl = context.factory.createImportDeclaration(
+      undefined,
+      context.factory.createImportClause(
+        false,
+        undefined,
+        context.factory.createNamedImports([
+          context.factory.createImportSpecifier(
+            false, undefined,
+            context.factory.createIdentifier("DistributedEventEmitter")
+          ),
+        ])
+      ),
+      context.factory.createStringLiteral(importPath)
+    );
+
+    return context.factory.updateSourceFile(transformed, [
+      importDecl,
+      ...transformed.statements,
+    ]);
+  };
+}
+
 // Read tsconfig.json
 const configPath = ts.findConfigFile(process.cwd(), ts.sys.fileExists, "tsconfig.json");
 if (!configPath) {
@@ -514,6 +665,9 @@ if (manifest.length > 0) {
 }
 if (cronManifest.length > 0) {
   transformers.push(createCronJobTransformer(cronManifest));
+}
+if (eventsManifest.length > 0) {
+  transformers.push(createEventEmitterTransformer(eventsManifest, DISTRIBUTED_EVENTS_IMPORT));
 }
 
 const emitResult = program.emit(undefined, undefined, undefined, false, {
@@ -664,6 +818,202 @@ if (addr && token && secretNames.length > 0) {
     }
   }
 }
+`);
+}
+
+function writeIIServerRuntime(out: string) {
+  const runtimeDir = join(out, "runtime");
+  mkdirSync(runtimeDir, { recursive: true });
+
+  writeFileSync(join(runtimeDir, "ii-server.mjs"), `\
+// II internal server — runs via node --import before the app starts.
+// Provides HTTP endpoints for Dapr to deliver pub/sub messages and cron callbacks.
+// No monkey-patching — this is a standalone server on its own port.
+
+import http from "node:http";
+
+const II_PORT = parseInt(process.env.II_SERVER_PORT || "3501", 10);
+const APP_PORT = parseInt(process.env.II_APP_PORT || "3000", 10);
+const eventsManifest = JSON.parse(process.env.II_EVENTS_MANIFEST || "[]");
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => resolve(body));
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  // GET /dapr/subscribe — programmatic subscription list
+  if (req.method === "GET" && req.url === "/dapr/subscribe") {
+    const subs = [];
+    for (const entry of eventsManifest) {
+      for (const event of entry.events) {
+        subs.push({
+          pubsubname: "ii-pubsub",
+          topic: \`\${entry.namespace}.\${event}\`,
+          route: \`/ii/events/\${entry.namespace}/\${event}\`,
+        });
+      }
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(subs));
+    return;
+  }
+
+  // POST /ii/events/{namespace}/{event} — pub/sub delivery
+  const eventsMatch = req.url?.match(/^\\/ii\\/events\\/([^/]+)\\/(.+)$/);
+  if (req.method === "POST" && eventsMatch) {
+    const [, namespace, event] = eventsMatch;
+    const body = await readBody(req);
+    try {
+      const envelope = JSON.parse(body);
+      // Dapr wraps pub/sub payloads in a CloudEvents envelope — unwrap .data
+      const payload = envelope.data ?? envelope;
+      for (const emitter of (globalThis.__ii_event_emitters || [])) {
+        if (emitter._namespace === namespace) {
+          emitter._deliver(event, payload);
+        }
+      }
+    } catch (err) {
+      console.error("[ii] Failed to deliver event:", err.message);
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end('{"status":"ok"}');
+    return;
+  }
+
+  // POST /ii/jobs/{name} — cron job callback, proxy to app
+  const jobsMatch = req.url?.match(/^\\/ii\\/jobs\\/(.+)$/);
+  if (req.method === "POST" && jobsMatch) {
+    const body = await readBody(req);
+    try {
+      const data = JSON.parse(body);
+      const { endpoint, method } = data;
+      await fetch(\`http://localhost:\${APP_PORT}\${endpoint}\`, { method: method || "GET" });
+    } catch (err) {
+      console.error("[ii] Failed to proxy cron job:", err.message);
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end('{"status":"ok"}');
+    return;
+  }
+
+  res.writeHead(404);
+  res.end("not found");
+});
+
+server.listen(II_PORT, () => {
+  console.log(\`[ii] Internal server listening on :\${II_PORT}\`);
+});
+`);
+}
+
+function writeDistributedEventsRuntime(out: string) {
+  const runtimeDir = join(out, "runtime");
+  mkdirSync(runtimeDir, { recursive: true });
+
+  writeFileSync(join(runtimeDir, "distributed-events.mjs"), `\
+// Distributed EventEmitter — replaces node:events EventEmitter with Dapr pub/sub.
+// emit() publishes to Dapr, handlers are invoked when Dapr delivers messages
+// through the II internal server.
+
+const DAPR_PORT = process.env.DAPR_HTTP_PORT || "3500";
+const PUBSUB_NAME = "ii-pubsub";
+
+export class DistributedEventEmitter {
+  #namespace;
+  #handlers = new Map();
+
+  constructor(namespace) {
+    this.#namespace = namespace;
+    globalThis.__ii_event_emitters = globalThis.__ii_event_emitters || [];
+    globalThis.__ii_event_emitters.push(this);
+  }
+
+  on(event, handler) {
+    if (!this.#handlers.has(event)) {
+      this.#handlers.set(event, new Set());
+    }
+    this.#handlers.get(event).add(handler);
+    return this;
+  }
+
+  once(event, handler) {
+    const wrapper = (...args) => {
+      this.off(event, wrapper);
+      handler(...args);
+    };
+    wrapper._original = handler;
+    return this.on(event, wrapper);
+  }
+
+  off(event, handler) {
+    const set = this.#handlers.get(event);
+    if (set) {
+      set.delete(handler);
+      for (const h of set) {
+        if (h._original === handler) {
+          set.delete(h);
+          break;
+        }
+      }
+    }
+    return this;
+  }
+
+  removeListener(event, handler) {
+    return this.off(event, handler);
+  }
+
+  async emit(event, ...args) {
+    const topic = \`\${this.#namespace}.\${event}\`;
+    try {
+      await fetch(\`http://localhost:\${DAPR_PORT}/v1.0/publish/\${PUBSUB_NAME}/\${topic}\`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ args }),
+      });
+    } catch (err) {
+      console.error(\`[ii] Failed to publish to \${topic}:\`, err.message);
+    }
+    return true;
+  }
+
+  _deliver(event, data) {
+    const set = this.#handlers.get(event);
+    if (!set) return;
+    const args = data?.args ?? [];
+    for (const handler of set) {
+      try {
+        handler(...args);
+      } catch (err) {
+        console.error(\`[ii] Handler error for \${this.#namespace}.\${event}:\`, err);
+      }
+    }
+  }
+
+  get _namespace() { return this.#namespace; }
+}
+`);
+}
+
+function writePubsubComponent(out: string) {
+  const componentsDir = join(out, "components");
+  mkdirSync(componentsDir, { recursive: true });
+
+  writeFileSync(join(componentsDir, "pubsub.yaml"), `\
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: ii-pubsub
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: valkey:6379
 `);
 }
 

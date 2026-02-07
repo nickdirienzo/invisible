@@ -27,6 +27,7 @@ export function plan(projectDir: string): App {
   const durableMaps = detectDurableMaps(program, projectDir, sourceFiles);
   const secrets = detectSecrets(program, projectDir, sourceFiles);
   const cronJobs = detectCronJobs(program, projectDir, sourceFiles);
+  const eventEmitters = detectEventEmitters(program, projectDir, sourceFiles);
   const resources: Resource[] = [
     ...durableMaps.map((m) => ({
       kind: "durable-map" as const,
@@ -45,6 +46,12 @@ export function plan(projectDir: string): App {
       method: c.method,
       intervalMs: c.intervalMs,
       sourceFile: c.file,
+    })),
+    ...eventEmitters.map((e) => ({
+      kind: "event-emitter" as const,
+      name: e.name,
+      sourceFile: e.file,
+      events: e.events,
     })),
   ];
 
@@ -397,6 +404,11 @@ const EXCLUDED_ENV_VARS = new Set([
   "TZ",
   "LANG",
   "LC_ALL",
+  "II_EVENTS_MANIFEST",
+  "II_CRON_JOBS",
+  "II_APP_PORT",
+  "II_SERVER_PORT",
+  "DAPR_HTTP_PORT",
 ]);
 
 /**
@@ -537,11 +549,12 @@ function detectCronJobs(
 
       const { endpoint, method } = fetchCall;
 
-      // Must be a /job/* route — Dapr calls POST /job/<name> directly
-      if (!endpoint.startsWith("/job/")) continue;
+      // Must be a local path — reject external URLs
+      if (!endpoint.startsWith("/")) continue;
+      if (endpoint.startsWith("//")) continue;
 
-      // Derive job name from the path after /job/
-      const name = endpoint.slice("/job/".length).replace(/\//g, "-");
+      // Derive job name from the path (strip leading /, replace / with -)
+      const name = endpoint.slice(1).replace(/\//g, "-");
 
       results.push({ name, endpoint, method, intervalMs, file });
     }
@@ -649,4 +662,120 @@ function resolveConstantNumeric(expr: ts.Expression): number | null {
   }
 
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// EventEmitter detection — module-scope new EventEmitter() from node:events
+// ---------------------------------------------------------------------------
+
+interface EventEmitterDetection {
+  name: string;
+  file: string;
+  events: string[];
+}
+
+/**
+ * Walk top-level statements looking for `new EventEmitter()` declarations
+ * where EventEmitter is imported from `node:events` or `events`.
+ * Only module-scope (top-level) EventEmitters are considered distributed.
+ * Function-scoped EventEmitters are ephemeral and ignored.
+ *
+ * For each detected emitter, we also walk the full AST for `.on()` and
+ * `.once()` calls with string literal event names to build the subscription list.
+ */
+function detectEventEmitters(
+  program: ts.Program,
+  projectDir: string,
+  files: string[]
+): EventEmitterDetection[] {
+  const results: EventEmitterDetection[] = [];
+
+  for (const file of files) {
+    const sourceFile = program.getSourceFile(join(projectDir, file));
+    if (!sourceFile) continue;
+
+    // Check if file imports EventEmitter from node:events or events
+    if (!importsEventEmitter(sourceFile)) continue;
+
+    // Phase 1: find top-level new EventEmitter() declarations
+    const emitterVars: string[] = [];
+    for (const statement of sourceFile.statements) {
+      if (!ts.isVariableStatement(statement)) continue;
+
+      for (const decl of statement.declarationList.declarations) {
+        if (
+          decl.initializer &&
+          ts.isNewExpression(decl.initializer) &&
+          ts.isIdentifier(decl.initializer.expression) &&
+          decl.initializer.expression.text === "EventEmitter" &&
+          ts.isIdentifier(decl.name)
+        ) {
+          emitterVars.push(decl.name.text);
+        }
+      }
+    }
+
+    // Phase 2: for each emitter var, extract event names from .on()/.once() calls
+    for (const varName of emitterVars) {
+      const events = extractEventNames(sourceFile, varName);
+      results.push({ name: varName, file, events });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Check if a source file imports EventEmitter from `node:events` or `events`.
+ */
+function importsEventEmitter(sourceFile: ts.SourceFile): boolean {
+  for (const statement of sourceFile.statements) {
+    if (
+      ts.isImportDeclaration(statement) &&
+      ts.isStringLiteral(statement.moduleSpecifier)
+    ) {
+      const mod = statement.moduleSpecifier.text;
+      if (mod === "node:events" || mod === "events") {
+        const clause = statement.importClause;
+        if (!clause) continue;
+
+        // Named import: import { EventEmitter } from 'node:events'
+        if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+          for (const spec of clause.namedBindings.elements) {
+            if (spec.name.text === "EventEmitter") return true;
+          }
+        }
+
+        // Default import: import EventEmitter from 'node:events'
+        if (clause.name?.text === "EventEmitter") return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Walk the full AST for `.on(stringLiteral, ...)` and `.once(stringLiteral, ...)`
+ * calls on the given variable name. Returns deduplicated event names.
+ */
+function extractEventNames(sourceFile: ts.SourceFile, varName: string): string[] {
+  const events = new Set<string>();
+
+  function visit(node: ts.Node) {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      ts.isIdentifier(node.expression.expression) &&
+      node.expression.expression.text === varName &&
+      (node.expression.name.text === "on" || node.expression.name.text === "once") &&
+      node.arguments.length >= 2 &&
+      ts.isStringLiteral(node.arguments[0])
+    ) {
+      events.add(node.arguments[0].text);
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return [...events];
 }

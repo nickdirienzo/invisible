@@ -209,6 +209,128 @@ function extractFetchEndpoint(body: ts.ConciseBody): string | null {
   return urlArg.text;
 }
 
+// ---------------------------------------------------------------------------
+// EventEmitter transformer — rewrites new EventEmitter() to DistributedEventEmitter
+// ---------------------------------------------------------------------------
+
+interface EventEmitterEntry {
+  varName: string;
+  namespace: string;
+}
+
+interface EventManifestEntry {
+  file: string;
+  emitters: EventEmitterEntry[];
+}
+
+/**
+ * Creates a TypeScript custom transformer that rewrites module-scope
+ * `new EventEmitter()` declarations to `new DistributedEventEmitter("namespace")`.
+ *
+ * This runs during tsc emit — the source files on disk are never modified.
+ * The transformer also injects an import for the DistributedEventEmitter class
+ * at the top of any file it modifies.
+ */
+export function createEventEmitterTransformer(
+  manifest: EventManifestEntry[],
+  distributedEventsImportPath: string
+): ts.TransformerFactory<ts.SourceFile> {
+  return (context) => {
+    return (sourceFile) => {
+      const entry = manifest.find((e) => {
+        const jsName = e.file.replace(/\.ts$/, ".js").replace(/\.mts$/, ".mjs");
+        return (
+          sourceFile.fileName.endsWith(e.file) ||
+          sourceFile.fileName.endsWith(jsName)
+        );
+      });
+
+      if (!entry || entry.emitters.length === 0) return sourceFile;
+
+      const varNames = new Map(entry.emitters.map((e) => [e.varName, e.namespace]));
+      let needsImport = false;
+
+      const visitor: ts.Visitor = (node) => {
+        // Only transform top-level variable statements
+        if (
+          ts.isVariableStatement(node) &&
+          node.parent === sourceFile
+        ) {
+          const newDeclarations = node.declarationList.declarations.map(
+            (decl) => {
+              if (
+                decl.initializer &&
+                ts.isNewExpression(decl.initializer) &&
+                ts.isIdentifier(decl.initializer.expression) &&
+                decl.initializer.expression.text === "EventEmitter" &&
+                ts.isIdentifier(decl.name) &&
+                varNames.has(decl.name.text)
+              ) {
+                needsImport = true;
+                const namespace = varNames.get(decl.name.text)!;
+
+                // new DistributedEventEmitter("namespace")
+                const newExpr = context.factory.createNewExpression(
+                  context.factory.createIdentifier("DistributedEventEmitter"),
+                  undefined,
+                  [context.factory.createStringLiteral(namespace)]
+                );
+
+                return context.factory.updateVariableDeclaration(
+                  decl,
+                  decl.name,
+                  decl.exclamationToken,
+                  undefined, // drop type annotation
+                  newExpr
+                );
+              }
+              return decl;
+            }
+          );
+
+          const newDeclList = context.factory.updateVariableDeclarationList(
+            node.declarationList,
+            newDeclarations
+          );
+          return context.factory.updateVariableStatement(
+            node,
+            node.modifiers,
+            newDeclList
+          );
+        }
+
+        return ts.visitEachChild(node, visitor, context);
+      };
+
+      const transformed = ts.visitEachChild(sourceFile, visitor, context);
+
+      if (!needsImport) return transformed;
+
+      // import { DistributedEventEmitter } from "<path>";
+      const importDecl = context.factory.createImportDeclaration(
+        undefined,
+        context.factory.createImportClause(
+          false,
+          undefined,
+          context.factory.createNamedImports([
+            context.factory.createImportSpecifier(
+              false,
+              undefined,
+              context.factory.createIdentifier("DistributedEventEmitter")
+            ),
+          ])
+        ),
+        context.factory.createStringLiteral(distributedEventsImportPath)
+      );
+
+      return context.factory.updateSourceFile(transformed, [
+        importDecl,
+        ...transformed.statements,
+      ]);
+    };
+  };
+}
+
 /**
  * Compiles TypeScript files with the DurableMap transformer applied.
  * This is the build function called from the generated build script
