@@ -10,24 +10,32 @@ interface PackageJson {
   scripts?: Record<string, string>;
 }
 
-export function plan(projectDir: string): App {
-  const pkg = readPackageJson(projectDir);
-  const appName = pkg.name ?? basename(projectDir);
-  const sourceFiles = findSourceFiles(projectDir);
+interface ServicePlan {
+  service: import("../ir/index.js").Service;
+  resources: Resource[];
+}
 
-  // Create one ts.Program shared across all detectors
-  const { program, checker } = createProgram(projectDir, sourceFiles);
+function planService(
+  serviceDir: string,
+  serviceName: string,
+  buildPath: string
+): ServicePlan {
+  const pkg = readPackageJson(serviceDir);
+  const sourceFiles = findSourceFiles(serviceDir);
+  const { program, checker } = createProgram(serviceDir, sourceFiles);
 
-  const listenResult = detectListenCall(program, checker, projectDir, sourceFiles);
-  const frameworkResult = !listenResult ? detectFrameworkStart(pkg) : null;
-  const hasIngress = listenResult !== null || frameworkResult !== null;
+  const listenResult = detectListenCall(program, checker, serviceDir, sourceFiles);
+  const buildMode = !listenResult ? detectBuildMode(pkg) : null;
+  const frameworkResult = buildMode?.kind === "framework" ? buildMode.result : null;
+  const staticResult = buildMode?.kind === "static" ? buildMode.result : null;
+  const hasIngress = listenResult !== null || frameworkResult !== null || staticResult !== null;
   const entrypoint = listenResult?.file ?? detectEntrypoint(sourceFiles);
   const typescript = entrypoint.endsWith(".ts") || entrypoint.endsWith(".tsx") || entrypoint.endsWith(".mts");
 
-  const durableMaps = detectDurableMaps(program, projectDir, sourceFiles);
-  const secrets = detectSecrets(program, projectDir, sourceFiles);
-  const cronJobs = detectCronJobs(program, projectDir, sourceFiles);
-  const eventEmitters = detectEventEmitters(program, projectDir, sourceFiles);
+  const durableMaps = detectDurableMaps(program, serviceDir, sourceFiles);
+  const secrets = detectSecrets(program, serviceDir, sourceFiles);
+  const cronJobs = detectCronJobs(program, serviceDir, sourceFiles);
+  const eventEmitters = detectEventEmitters(program, serviceDir, sourceFiles);
   const resources: Resource[] = [
     ...durableMaps.map((m) => ({
       kind: "durable-map" as const,
@@ -56,20 +64,75 @@ export function plan(projectDir: string): App {
   ];
 
   return {
+    service: {
+      name: serviceName,
+      build: buildPath,
+      port: listenResult?.port ?? frameworkResult?.port ?? (staticResult ? 80 : 3000),
+      entrypoint,
+      typescript,
+      ...(hasIngress ? { ingress: [{ host: "", path: "/" }] } : {}),
+      ...(frameworkResult?.startCmd ? { startCmd: frameworkResult.startCmd } : {}),
+      ...(frameworkResult?.buildCmd ? { buildCmd: frameworkResult.buildCmd } : {}),
+      ...(staticResult ? { buildCmd: staticResult.buildCmd, static: true } : {}),
+    },
+    resources,
+  };
+}
+
+function discoverServiceDirs(projectDir: string): Array<{ name: string; dir: string }> {
+  const entries = readdirSync(projectDir, { withFileTypes: true });
+  const serviceDirs: Array<{ name: string; dir: string }> = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+
+    const subDir = join(projectDir, entry.name);
+    const pkgPath = join(subDir, "package.json");
+    try {
+      readFileSync(pkgPath, "utf-8");
+      serviceDirs.push({ name: entry.name, dir: subDir });
+    } catch {
+      // No package.json — not a service
+    }
+  }
+
+  return serviceDirs;
+}
+
+export function plan(projectDir: string): App {
+  const pkg = readPackageJson(projectDir);
+  const appName = pkg.name ?? basename(projectDir);
+
+  // Check for monorepo structure (subdirectories with package.json)
+  const serviceDirs = discoverServiceDirs(projectDir);
+
+  if (serviceDirs.length > 0) {
+    const services: import("../ir/index.js").Service[] = [];
+    const allResources: Resource[] = [];
+
+    for (const svcDir of serviceDirs) {
+      const result = planService(svcDir.dir, svcDir.name, `./${svcDir.name}`);
+      services.push(result.service);
+      // Prefix sourceFile with service dir for disambiguation
+      for (const r of result.resources) {
+        allResources.push({ ...r, sourceFile: `${svcDir.name}/${r.sourceFile}` });
+      }
+    }
+
+    return {
+      name: appName,
+      services,
+      ...(allResources.length > 0 ? { resources: allResources } : {}),
+    };
+  }
+
+  // Single-service project (current behavior)
+  const result = planService(projectDir, "web", "./");
+  return {
     name: appName,
-    services: [
-      {
-        name: "web",
-        build: "./",
-        port: listenResult?.port ?? frameworkResult?.port ?? 3000,
-        entrypoint,
-        typescript,
-        ...(hasIngress ? { ingress: [{ host: "", path: "/" }] } : {}),
-        ...(frameworkResult?.startCmd ? { startCmd: frameworkResult.startCmd } : {}),
-        ...(frameworkResult?.buildCmd ? { buildCmd: frameworkResult.buildCmd } : {}),
-      },
-    ],
-    ...(resources.length > 0 ? { resources } : {}),
+    services: [result.service],
+    ...(result.resources.length > 0 ? { resources: result.resources } : {}),
   };
 }
 
@@ -115,28 +178,45 @@ interface FrameworkResult {
   buildCmd: string;
 }
 
+interface StaticSiteResult {
+  buildCmd: string;
+}
+
+type BuildDetectionResult =
+  | { kind: "framework"; result: FrameworkResult }
+  | { kind: "static"; result: StaticSiteResult }
+  | null;
+
 /**
- * Detects framework-based apps from scripts.start + scripts.build in
- * package.json. Both are required — this is an opinionated contract.
- *
+ * Detects how a service is built+served from package.json scripts.
  * Only checked when no explicit .listen() call is found in source code.
- * Covers Remix, Next, Nuxt, SvelteKit, Astro, etc. without needing
- * framework-specific knowledge.
+ *
+ * Detection cascade:
+ *   1. scripts.build + scripts.start → server framework (Remix, Next, etc.)
+ *   2. scripts.build + no scripts.start → static site (Vite, CRA, etc.)
+ *   3. Neither → null (no detection)
+ *
+ * The key insight: if the code had a server, we'd have found a .listen() call.
+ * A build script without a start script means the output is static files —
+ * no server process needed, just nginx.
  */
-function detectFrameworkStart(pkg: PackageJson): FrameworkResult | null {
+function detectBuildMode(pkg: PackageJson): BuildDetectionResult {
   const startScript = pkg.scripts?.start;
   const buildScript = pkg.scripts?.build;
-  if (!startScript || !buildScript) return null;
+  if (!buildScript) return null;
 
-  // Extract port from --port flag if present, otherwise default to 3000
-  const portMatch = startScript.match(/--port\s+(\d+)/);
-  const port = portMatch ? parseInt(portMatch[1], 10) : 3000;
+  if (startScript) {
+    // Extract port from --port flag if present, otherwise default to 3000
+    const portMatch = startScript.match(/--port\s+(\d+)/);
+    const port = portMatch ? parseInt(portMatch[1], 10) : 3000;
+    return {
+      kind: "framework",
+      result: { port, startCmd: startScript, buildCmd: buildScript },
+    };
+  }
 
-  return {
-    port,
-    startCmd: startScript,
-    buildCmd: buildScript,
-  };
+  // scripts.build without scripts.start → static site
+  return { kind: "static", result: { buildCmd: buildScript } };
 }
 
 // ---------------------------------------------------------------------------

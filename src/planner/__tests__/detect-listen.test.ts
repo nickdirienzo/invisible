@@ -178,7 +178,7 @@ describe("detectFrameworkStart", () => {
     expect(result.services[0].port).toBe(4000);
   });
 
-  it("does not detect framework when scripts.start is missing", () => {
+  it("detects static site when scripts.build exists without scripts.start", () => {
     const dir = makeProject({
       "package.json": JSON.stringify({
         name: "no-start",
@@ -190,7 +190,10 @@ describe("detectFrameworkStart", () => {
     });
     const result = plan(dir);
     expect(result.services[0].startCmd).toBeUndefined();
-    expect(result.services[0].ingress).toBeUndefined();
+    expect(result.services[0].static).toBe(true);
+    expect(result.services[0].buildCmd).toBe("tsc");
+    expect(result.services[0].port).toBe(80);
+    expect(result.services[0].ingress).toEqual([{ host: "", path: "/" }]);
   });
 
   it("prefers .listen() over framework detection", () => {

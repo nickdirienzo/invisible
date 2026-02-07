@@ -265,9 +265,9 @@ describe("compileToDockerfile with framework app", () => {
     expect(dockerfile).toContain("EXPOSE 3000");
   });
 
-  it("prunes dev deps after build", () => {
+  it("does not prune dev deps (start script may need them)", () => {
     const dockerfile = compileToDockerfile(remixApp.services[0], "");
-    expect(dockerfile).toContain("RUN npm prune --omit=dev");
+    expect(dockerfile).not.toContain("npm prune");
   });
 
   it("does not use tsc or multi-stage build", () => {
@@ -323,6 +323,58 @@ describe("compileToK8s with secrets", () => {
       (d) => d.kind === "Deployment" && d.metadata.name === "valkey"
     );
     expect(valkeyDeploy).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Static site Dockerfile compilation (nginx)
+// ---------------------------------------------------------------------------
+
+const staticApp: App = {
+  name: "static-app",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 80,
+      entrypoint: "index.ts",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+      buildCmd: "vite build",
+      static: true,
+    },
+  ],
+};
+
+describe("compileToDockerfile with static site", () => {
+  it("produces multi-stage build with nginx", () => {
+    const dockerfile = compileToDockerfile(staticApp.services[0], "");
+    expect(dockerfile).toContain("FROM node:22-slim AS build");
+    expect(dockerfile).toContain("RUN npm run build");
+    expect(dockerfile).toContain("FROM nginx:alpine");
+    expect(dockerfile).toContain("COPY --from=build /app/dist /usr/share/nginx/html");
+    expect(dockerfile).toContain("EXPOSE 80");
+  });
+
+  it("does not include node CMD or tsc", () => {
+    const dockerfile = compileToDockerfile(staticApp.services[0], "");
+    expect(dockerfile).not.toContain("CMD [\"node\"");
+    expect(dockerfile).not.toContain("CMD [\"npm\"");
+    expect(dockerfile).not.toContain("tsc");
+  });
+
+  it("uses monorepo copy paths when build is a subdirectory", () => {
+    const monoStaticSvc = { ...staticApp.services[0], build: "./web" };
+    const dockerfile = compileToDockerfile(monoStaticSvc, "");
+    expect(dockerfile).toContain("COPY web/package.json package-lock.json ./");
+    expect(dockerfile).toContain("COPY web/ .");
+  });
+});
+
+describe("compileToCompose with static site", () => {
+  it("exposes port 80", () => {
+    const doc = parse(compileToCompose(staticApp));
+    expect(doc.services.web.ports).toEqual(["80:80"]);
   });
 });
 
