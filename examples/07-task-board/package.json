@@ -1,0 +1,6 @@
+{
+  "name": "07-task-board",
+  "version": "0.0.1",
+  "private": true,
+  "workspaces": ["api", "web"]
+}
