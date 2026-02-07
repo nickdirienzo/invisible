@@ -59,13 +59,18 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST /ii/jobs/{name} — cron job callback, proxy to app
-  const jobsMatch = req.url?.match(/^\/ii\/jobs\/(.+)$/);
+  // POST /job/{name} — Dapr Jobs callback, proxy to app.
+  // Dapr delivers triggered jobs to POST /job/<job-name> on the app port.
+  // The payload is the `data` field we registered (a JSON string).
+  const jobsMatch = req.url?.match(/^\/job\/(.+)$/);
   if (req.method === "POST" && jobsMatch) {
     const body = await readBody(req);
     try {
-      const data = JSON.parse(body);
-      const { endpoint, method } = data;
+      // data was registered as JSON.stringify({endpoint, method}), Dapr
+      // delivers it as bytes — parse the outer envelope then the inner payload.
+      const envelope = JSON.parse(body);
+      const payload = typeof envelope === "string" ? JSON.parse(envelope) : envelope;
+      const { endpoint, method } = payload;
       await fetch(`http://localhost:${APP_PORT}${endpoint}`, { method: method || "GET" });
     } catch (err) {
       console.error("[ii] Failed to proxy cron job:", err.message);
