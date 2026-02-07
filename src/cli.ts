@@ -14,7 +14,7 @@ const RESOURCES_FILE = "resources.json";
 
 const USAGE = `Usage:
   ii plan             [project-dir]   Analyze source, write .ii/${PLAN_FILE}
-  ii local up         [project-dir]   Build and start locally via Docker Compose
+  ii local up         [project-dir] [--no-cache]  Build and start locally via Docker Compose
   ii local down       [project-dir]   Stop and remove local containers
   ii local logs       [project-dir]   Stream app service logs
   ii deploy --k8s     [project-dir]   Compile to Kubernetes manifests
@@ -24,6 +24,7 @@ interface DeployOpts {
   target: string;
   planFile: string | null;
   projectDir: string;
+  noCache?: boolean;
 }
 
 function parseDeployArgs(args: string[]): DeployOpts {
@@ -62,9 +63,11 @@ async function main() {
     doPlan(projectDir);
   } else if (command === "local") {
     const subcommand = args[1];
-    const projectDir = resolve(args[2] ?? ".");
+    const localArgs = args.slice(2);
+    const noCache = localArgs.includes("--no-cache");
+    const projectDir = resolve(localArgs.find((a) => !a.startsWith("--")) ?? ".");
     if (subcommand === "up") {
-      await doDeployLocal({ target: "--local", planFile: null, projectDir });
+      await doDeployLocal({ target: "--local", planFile: null, projectDir, noCache });
     } else if (subcommand === "down") {
       doLocalDown(projectDir);
     } else if (subcommand === "logs") {
@@ -253,7 +256,7 @@ function resourceBelongsToService(r: import("./ir/index.js").Resource, svc: impo
   return r.sourceFile.startsWith(prefix + "/");
 }
 
-async function doDeployLocal({ projectDir, planFile }: DeployOpts) {
+async function doDeployLocal({ projectDir, planFile, noCache }: DeployOpts) {
   const app = loadOrPlan(projectDir, planFile);
   const out = iiDir(projectDir);
   const isMultiService = app.services.length > 1;
@@ -316,6 +319,12 @@ async function doDeployLocal({ projectDir, planFile }: DeployOpts) {
   console.log(`${app.name}: deploying ${app.services.length} service(s) locally...\n`);
 
   // Start everything in detached mode (project name scoped to app)
+  if (noCache) {
+    execSync(`docker compose -p ${app.name} -f ${II_DIR}/docker-compose.yml build --no-cache`, {
+      cwd: projectDir,
+      stdio: "inherit",
+    });
+  }
   execSync(`docker compose -p ${app.name} -f ${II_DIR}/docker-compose.yml up -d --build`, {
     cwd: projectDir,
     stdio: "inherit",
@@ -392,12 +401,25 @@ async function reconcileCronJobs(
   const STATE_STORE = "ii-state";
   const STATE_KEY = "registered-cron-jobs";
 
-  // Wait for Dapr sidecar to be ready
+  // Wait for Dapr sidecar AND scheduler to be ready.
+  // healthz alone isn't enough — the scheduler connection may still be initialising
+  // after the sidecar HTTP server is up.  Poll the Jobs API endpoint instead.
   console.log("  Waiting for Dapr sidecar...");
   for (let i = 0; i < 30; i++) {
     try {
       const res = await fetch(`${DAPR_BASE}/v1.0/healthz`);
       if (res.ok) break;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  // Give the scheduler connection a moment to establish after healthz passes
+  console.log("  Waiting for Dapr scheduler...");
+  for (let i = 0; i < 15; i++) {
+    try {
+      // A GET on a non-existent job returns 500 when the scheduler isn't connected,
+      // but returns 404/200 (or similar non-error) when it is.
+      const res = await fetch(`${DAPR_BASE}/v1.0-alpha1/jobs/__ii_probe`);
+      if (res.status !== 500) break;
     } catch {}
     await new Promise((r) => setTimeout(r, 1000));
   }
@@ -422,20 +444,32 @@ async function reconcileCronJobs(
     }
   }
 
-  // Register each current job
+  // Register each current job (with retries — scheduler may still be warming up)
   for (const job of cronJobs) {
-    try {
-      await fetch(`${DAPR_BASE}/v1.0-alpha1/jobs/${job.name}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          schedule: `@every ${job.intervalMs}ms`,
-          data: { endpoint: job.endpoint, method: job.method },
-        }),
-      });
-      console.log(`  Registered cron job: ${job.name} (every ${job.intervalMs}ms)`);
-    } catch (err) {
-      console.error(`  Failed to register cron job ${job.name}:`, (err as Error).message);
+    let registered = false;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const res = await fetch(`${DAPR_BASE}/v1.0-alpha1/jobs/${job.name}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            schedule: `@every ${job.intervalMs}ms`,
+            data: JSON.stringify({ endpoint: job.endpoint, method: job.method }),
+          }),
+        });
+        if (res.ok) {
+          console.log(`  Registered cron job: ${job.name} (every ${job.intervalMs}ms)`);
+          registered = true;
+          break;
+        }
+        // Non-OK response — scheduler may not be ready, retry
+      } catch {
+        // Connection failed — retry
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    if (!registered) {
+      console.error(`  Failed to register cron job ${job.name} after retries`);
     }
   }
 
@@ -637,10 +671,9 @@ function createCronJobTransformer(cronManifest) {
 
     const endpoints = new Set(entry.jobs.map((j) => j.endpoint));
 
-    const visitor = (node) => {
+    const newStatements = sourceFile.statements.map((node) => {
       if (
         ts.isExpressionStatement(node) &&
-        node.parent === sourceFile &&
         ts.isCallExpression(node.expression) &&
         ts.isIdentifier(node.expression.expression) &&
         node.expression.expression.text === "setInterval" &&
@@ -654,10 +687,10 @@ function createCronJobTransformer(cronManifest) {
           }
         }
       }
-      return ts.visitEachChild(node, visitor, context);
-    };
+      return node;
+    });
 
-    return ts.visitEachChild(sourceFile, visitor, context);
+    return context.factory.updateSourceFile(sourceFile, newStatements);
   };
 }
 
@@ -962,8 +995,12 @@ spec:
 
 /**
  * Write .ii/components/statestore.yaml — Dapr state store component backed
- * by SQLite. Used by the cron shim to persist registered job names across
- * restarts so it can reconcile stale jobs on the next deploy.
+ * by Valkey (Redis-compatible). Used by the CLI to persist registered job
+ * names across restarts so it can reconcile stale jobs on the next deploy.
+ *
+ * We reuse the same Valkey instance that backs durable maps / pub-sub.
+ * The previous SQLite backend crashed the sidecar because the daprd
+ * distroless image runs as UID 65532 and can't write to Docker volumes.
  */
 function writeDaprComponents(out: string) {
   const componentsDir = join(out, "components");
@@ -975,11 +1012,11 @@ kind: Component
 metadata:
   name: ii-state
 spec:
-  type: state.sqlite
+  type: state.redis
   version: v1
   metadata:
-  - name: connectionString
-    value: /state/ii-state.db
+  - name: redisHost
+    value: valkey:6379
 `);
 }
 

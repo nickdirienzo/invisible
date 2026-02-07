@@ -449,10 +449,9 @@ describe("compileToCompose with cron jobs", () => {
     expect(doc.services["web-dapr"].depends_on).toContain("dapr-scheduler");
   });
 
-  it("Dapr sidecar mounts components dir and state volume", () => {
+  it("Dapr sidecar mounts components dir", () => {
     const doc = parse(compileToCompose(cronApp));
     expect(doc.services["web-dapr"].volumes).toContain("./components:/components");
-    expect(doc.services["web-dapr"].volumes).toContain("dapr-state:/state");
   });
 
   it("Dapr sidecar has -resources-path flag", () => {
@@ -460,12 +459,6 @@ describe("compileToCompose with cron jobs", () => {
     const cmd = doc.services["web-dapr"].command;
     expect(cmd).toContain("-resources-path");
     expect(cmd).toContain("/components");
-  });
-
-  it("declares dapr-state named volume", () => {
-    const doc = parse(compileToCompose(cronApp));
-    expect(doc.volumes).toBeDefined();
-    expect(doc.volumes["dapr-state"]).toBeDefined();
   });
 });
 
@@ -520,7 +513,7 @@ describe("compileToK8s with cron jobs", () => {
       (d) => d.kind === "Component" && d.metadata.name === "ii-state"
     );
     expect(stateStore).toBeDefined();
-    expect(stateStore.spec.type).toBe("state.sqlite");
+    expect(stateStore.spec.type).toBe("state.redis");
   });
 });
 

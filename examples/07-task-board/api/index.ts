@@ -27,10 +27,10 @@ taskEvents.on("task:moved", (data) => {
   console.log(`Task moved: ${JSON.stringify(data)}`);
 });
 
-// Cron job — runs cleanup daily via Dapr scheduler at deploy time
+// Cron job — runs cleanup every 30 seconds via Dapr scheduler at deploy time
 setInterval(() => {
   fetch("/api/cleanup", { method: "POST" });
-}, 24 * 60 * 60 * 1000);
+}, 30 * 1000);
 
 app.use(express.json());
 app.use((_req, res, next) => {
