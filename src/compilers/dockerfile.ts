@@ -64,10 +64,8 @@ CMD ["npm", "run", "start"]
     const buildCopyParts: string[] = [];
     if (needsCustomBuild) {
       buildCopyParts.push("COPY .ii/build.mjs ./.ii/build.mjs");
-      if (hasResources) buildCopyParts.push("COPY .ii/resources.json ./.ii/resources.json");
-      if (hasCronJobs) buildCopyParts.push("COPY .ii/cron-jobs.json ./.ii/cron-jobs.json");
-      if (hasEvents) buildCopyParts.push("COPY .ii/events.json ./.ii/events.json");
-      buildCopyParts.push("RUN node .ii/build.mjs");
+      buildCopyParts.push("COPY .ii/resources.json ./.ii/resources.json");
+      buildCopyParts.push(`RUN II_SERVICE=${svc.name} node .ii/build.mjs`);
     }
     const buildCmd = needsCustomBuild
       ? buildCopyParts.join("\n")

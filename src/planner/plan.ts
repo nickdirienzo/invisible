@@ -34,6 +34,7 @@ function planService(
 
   const durableMaps = detectDurableMaps(program, serviceDir, sourceFiles);
   const secrets = detectSecrets(program, serviceDir, sourceFiles);
+  const envVars = detectEnvVars(program, serviceDir, sourceFiles);
   const cronJobs = detectCronJobs(program, serviceDir, sourceFiles);
   const eventEmitters = detectEventEmitters(program, serviceDir, sourceFiles);
   const resources: Resource[] = [
@@ -46,6 +47,11 @@ function planService(
       kind: "secret" as const,
       name: s.name,
       sourceFile: s.file,
+    })),
+    ...envVars.map((v) => ({
+      kind: "env-var" as const,
+      name: v.name,
+      sourceFile: v.file,
     })),
     ...cronJobs.map((c) => ({
       kind: "cron-job" as const,
@@ -550,6 +556,69 @@ function walkForProcessEnv(
       ts.isStringLiteral(node.argumentExpression)
     ) {
       onFound(node.argumentExpression.text);
+      return;
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+}
+
+// ---------------------------------------------------------------------------
+// Build-time env var detection (import.meta.env → Docker build ARG)
+// ---------------------------------------------------------------------------
+
+interface EnvVarDetection {
+  name: string;
+  file: string;
+}
+
+/**
+ * Walk the full AST looking for `import.meta.env.VARIABLE_NAME` access patterns.
+ * These are build-time environment variables (used by Vite, etc.) that get inlined
+ * at build time — distinct from process.env secrets which are fetched at runtime.
+ */
+function detectEnvVars(
+  program: ts.Program,
+  projectDir: string,
+  files: string[]
+): EnvVarDetection[] {
+  const results: EnvVarDetection[] = [];
+  const seen = new Set<string>();
+
+  for (const file of files) {
+    const sourceFile = program.getSourceFile(join(projectDir, file));
+    if (!sourceFile) continue;
+
+    walkForImportMetaEnv(sourceFile, (envVarName) => {
+      const key = `${file}:${envVarName}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        results.push({ name: envVarName, file });
+      }
+    });
+  }
+
+  return results;
+}
+
+function walkForImportMetaEnv(
+  sourceFile: ts.SourceFile,
+  onFound: (envVarName: string) => void
+): void {
+  function visit(node: ts.Node) {
+    // Pattern: import.meta.env.VARIABLE_NAME
+    // AST: PropertyAccess(.VARIABLE_NAME, PropertyAccess(.env, MetaProperty(import.meta)))
+    if (
+      ts.isPropertyAccessExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === "env" &&
+      ts.isMetaProperty(node.expression.expression) &&
+      node.expression.expression.keywordToken === ts.SyntaxKind.ImportKeyword &&
+      node.expression.expression.name.text === "meta"
+    ) {
+      onFound(node.name.text);
       return;
     }
 

@@ -59,4 +59,10 @@ export interface EventEmitterResource {
   events: string[];
 }
 
-export type Resource = DurableMapResource | SecretResource | CronJobResource | EventEmitterResource;
+export interface EnvVarResource {
+  kind: "env-var";
+  name: string;
+  sourceFile: string;
+}
+
+export type Resource = DurableMapResource | SecretResource | CronJobResource | EventEmitterResource | EnvVarResource;
