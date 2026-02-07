@@ -19,3 +19,14 @@ by the runtime shim. We need:
 - **Production OpenBao** — the current dev-mode OpenBao (in-memory, root token)
   is fine for local dev but production needs persistent storage, proper auth
   policies, and token rotation.
+
+## Distributed `.once` Semantics
+
+Should `.once()` on a `DistributedEventEmitter` have cluster-wide semantics?
+Currently it only auto-removes the handler on the local instance after first
+delivery. With Dapr consumer groups, each message already goes to one instance,
+so `.once` means "this instance stops listening after its first delivery" — but
+other instances remain subscribed. A true cluster-wide `.once` (fire globally
+once, then unsubscribe everywhere) would need coordination (e.g. a Valkey key
+to track consumption and dynamic Dapr topic unsubscription). Open question
+whether that's worth the complexity or if local `.once` is sufficient.
