@@ -228,8 +228,9 @@ spec:
   });
 
   it("cron job proxies to mock app server", async () => {
+    // Dapr delivers triggered jobs to POST /job/<name> with the data payload
     const res = await fetch(
-      `http://localhost:${iiServerPort}/ii/jobs/daily-report`,
+      `http://localhost:${iiServerPort}/job/daily-report`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },

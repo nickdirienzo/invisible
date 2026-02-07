@@ -230,10 +230,10 @@ function makeDaprStateStoreComponent(): K8sManifest {
     kind: "Component",
     metadata: { name: "ii-state" },
     spec: {
-      type: "state.sqlite",
+      type: "state.redis",
       version: "v1",
       metadata: [
-        { name: "connectionString", value: "/state/ii-state.db" },
+        { name: "redisHost", value: "valkey:6379" },
       ],
     },
   };
@@ -271,7 +271,7 @@ export function compileToK8s(app: App): string {
     }
   }
 
-  if (hasMaps || hasEvents) {
+  if (hasMaps || hasEvents || hasCron) {
     manifests.push(makeValkeyDeployment());
     manifests.push(makeValkeyService());
   }

@@ -135,7 +135,9 @@ export function compileToCompose(app: App): string {
     }
 
     const deps: string[] = [];
-    if (svcHasMaps || svcHasEvents) deps.push("valkey");
+    // Cron jobs need Valkey too — the Dapr state store (used for job
+    // reconciliation) is backed by Valkey instead of SQLite.
+    if (svcHasMaps || svcHasEvents || svcHasCron) deps.push("valkey");
     if (svcHasSecrets) deps.push("openbao");
     if (deps.length > 0) {
       composeSvc.depends_on = deps;
@@ -148,7 +150,6 @@ export function compileToCompose(app: App): string {
       if (svcHasCron) sidecarDeps.push("dapr-scheduler");
 
       const sidecarVolumes = ["./components:/components"];
-      if (svcHasCron) sidecarVolumes.push("dapr-state:/state");
 
       compose.services[`${svc.name}-dapr`] = {
         image: "daprio/daprd:latest",
@@ -167,7 +168,9 @@ export function compileToCompose(app: App): string {
     }
   }
 
-  if (appHasMaps || appHasEvents) {
+  // Valkey is needed for durable maps, events (pub/sub), and cron jobs
+  // (Dapr state store for job reconciliation).
+  if (appHasMaps || appHasEvents || appHasCron) {
     compose.services.valkey = {
       image: "valkey/valkey:8-alpine",
       command: ["valkey-server", "--appendonly", "yes"],
@@ -199,8 +202,7 @@ export function compileToCompose(app: App): string {
   }
 
   const volumes: Record<string, Record<string, never>> = {};
-  if (appHasMaps || appHasEvents) volumes["valkey-data"] = {};
-  if (appHasCron) volumes["dapr-state"] = {};
+  if (appHasMaps || appHasEvents || appHasCron) volumes["valkey-data"] = {};
   if (Object.keys(volumes).length > 0) {
     compose.volumes = volumes;
   }

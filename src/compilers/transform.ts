@@ -158,10 +158,13 @@ export function createCronJobTransformer(
 
       const endpoints = new Set(entry.jobs.map((j) => j.endpoint));
 
-      const visitor: ts.Visitor = (node) => {
+      // Filter top-level statements directly instead of using a recursive
+      // visitor with `node.parent === sourceFile`.  The parent check breaks
+      // when a prior transformer (e.g. durable-map) creates a new SourceFile
+      // node — existing children still point at the *old* SourceFile.
+      const newStatements = sourceFile.statements.map((node) => {
         if (
           ts.isExpressionStatement(node) &&
-          node.parent === sourceFile &&
           ts.isCallExpression(node.expression) &&
           ts.isIdentifier(node.expression.expression) &&
           node.expression.expression.text === "setInterval" &&
@@ -171,16 +174,14 @@ export function createCronJobTransformer(
           if (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)) {
             const fetchEndpoint = extractFetchEndpoint(callback.body);
             if (fetchEndpoint && endpoints.has(fetchEndpoint)) {
-              // Replace with empty statement
               return context.factory.createEmptyStatement();
             }
           }
         }
+        return node;
+      });
 
-        return ts.visitEachChild(node, visitor, context);
-      };
-
-      return ts.visitEachChild(sourceFile, visitor, context);
+      return context.factory.updateSourceFile(sourceFile, newStatements);
     };
   };
 }
