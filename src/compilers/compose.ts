@@ -1,5 +1,5 @@
 import { stringify } from "yaml";
-import type { App } from "../ir/index.js";
+import type { App, EventEmitterResource } from "../ir/index.js";
 
 interface ComposeBuild {
   context: string;
@@ -34,6 +34,10 @@ function hasCronJobs(app: App): boolean {
   return app.resources?.some((r) => r.kind === "cron-job") ?? false;
 }
 
+function hasEventEmitters(app: App): boolean {
+  return app.resources?.some((r) => r.kind === "event-emitter") ?? false;
+}
+
 function getSecretNames(app: App): string[] {
   return [...new Set(
     (app.resources ?? [])
@@ -42,11 +46,25 @@ function getSecretNames(app: App): string[] {
   )];
 }
 
+function getEventsManifest(app: App): Array<{ namespace: string; events: string[] }> {
+  return (app.resources ?? [])
+    .filter((r): r is EventEmitterResource => r.kind === "event-emitter")
+    .map((r) => ({ namespace: r.name, events: r.events }));
+}
+
+function getCronJobsManifest(app: App): Array<{ name: string; endpoint: string; method: string }> {
+  return (app.resources ?? [])
+    .filter((r) => r.kind === "cron-job")
+    .map((r) => r.kind === "cron-job" ? { name: r.name, endpoint: r.endpoint, method: r.method } : { name: "", endpoint: "", method: "" });
+}
+
 export function compileToCompose(app: App): string {
   const compose: ComposeFile = { services: {} };
   const hasMaps = hasDurableMaps(app);
   const hasSecretResources = hasSecrets(app);
   const hasCron = hasCronJobs(app);
+  const hasEvents = hasEventEmitters(app);
+  const hasDapr = hasCron || hasEvents;
 
   for (const svc of app.services) {
     const composeSvc: ComposeService = {
@@ -62,7 +80,7 @@ export function compileToCompose(app: App): string {
     }
     // Expose Dapr HTTP port so the CLI can reconcile jobs at deploy time.
     // The sidecar uses network_mode: service:<app>, so its ports are on the app's network.
-    if (hasCron) {
+    if (hasDapr) {
       ports.push("3500:3500");
     }
     if (ports.length > 0) {
@@ -70,7 +88,7 @@ export function compileToCompose(app: App): string {
     }
 
     const env: Record<string, string> = { ...(svc.env ?? {}) };
-    if (hasMaps) {
+    if (hasMaps || hasEvents) {
       env.VALKEY_URL = "valkey://valkey:6379";
     }
     if (hasSecretResources) {
@@ -78,14 +96,21 @@ export function compileToCompose(app: App): string {
       env.OPENBAO_TOKEN = "dev-root-token";
       env.OPENBAO_SECRETS = JSON.stringify(getSecretNames(app));
     }
-    // Note: cron job registration is handled by the CLI at deploy time,
-    // not by the app at startup. No DAPR_CRON_JOBS env var needed.
+    if (hasDapr) {
+      env.II_APP_PORT = String(svc.port);
+    }
+    if (hasEvents) {
+      env.II_EVENTS_MANIFEST = JSON.stringify(getEventsManifest(app));
+    }
+    if (hasCron) {
+      env.II_CRON_JOBS = JSON.stringify(getCronJobsManifest(app));
+    }
     if (Object.keys(env).length > 0) {
       composeSvc.environment = env;
     }
 
     const deps: string[] = [];
-    if (hasMaps) deps.push("valkey");
+    if (hasMaps || hasEvents) deps.push("valkey");
     if (hasSecretResources) deps.push("openbao");
     if (deps.length > 0) {
       composeSvc.depends_on = deps;
@@ -93,28 +118,31 @@ export function compileToCompose(app: App): string {
 
     compose.services[svc.name] = composeSvc;
 
-    if (hasCron) {
+    if (hasDapr) {
+      const sidecarDeps = [svc.name];
+      if (hasCron) sidecarDeps.push("dapr-scheduler");
+
+      const sidecarVolumes = ["./components:/components"];
+      if (hasCron) sidecarVolumes.push("dapr-state:/state");
+
       compose.services[`${svc.name}-dapr`] = {
         image: "daprio/daprd:latest",
         command: [
           "./daprd",
           "-app-id", svc.name,
-          "-app-port", String(svc.port),
+          "-app-port", "3501",
           "-dapr-http-port", "3500",
-          "-scheduler-host-address", "dapr-scheduler:50006",
+          ...(hasCron ? ["-scheduler-host-address", "dapr-scheduler:50006"] : []),
           "-resources-path", "/components",
         ],
         network_mode: `service:${svc.name}`,
-        depends_on: [svc.name, "dapr-scheduler"],
-        volumes: [
-          "./.ii/components:/components",
-          "dapr-state:/state",
-        ],
+        depends_on: sidecarDeps,
+        volumes: sidecarVolumes,
       };
     }
   }
 
-  if (hasMaps) {
+  if (hasMaps || hasEvents) {
     compose.services.valkey = {
       image: "valkey/valkey:8-alpine",
       ports: ["6379:6379"],

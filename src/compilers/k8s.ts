@@ -1,5 +1,5 @@
 import { stringify } from "yaml";
-import type { App, Service } from "../ir/index.js";
+import type { App, Service, EventEmitterResource } from "../ir/index.js";
 
 interface K8sManifest {
   apiVersion: string;
@@ -20,6 +20,10 @@ function hasCronJobs(app: App): boolean {
   return app.resources?.some((r) => r.kind === "cron-job") ?? false;
 }
 
+function hasEventEmitters(app: App): boolean {
+  return app.resources?.some((r) => r.kind === "event-emitter") ?? false;
+}
+
 function getSecretNames(app: App): string[] {
   return [...new Set(
     (app.resources ?? [])
@@ -28,7 +32,19 @@ function getSecretNames(app: App): string[] {
   )];
 }
 
-function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResources: boolean, hasCron: boolean): K8sManifest {
+function getEventsManifest(app: App): Array<{ namespace: string; events: string[] }> {
+  return (app.resources ?? [])
+    .filter((r): r is EventEmitterResource => r.kind === "event-emitter")
+    .map((r) => ({ namespace: r.name, events: r.events }));
+}
+
+function getCronJobsManifest(app: App): Array<{ name: string; endpoint: string; method: string }> {
+  return (app.resources ?? [])
+    .filter((r) => r.kind === "cron-job")
+    .map((r) => r.kind === "cron-job" ? { name: r.name, endpoint: r.endpoint, method: r.method } : { name: "", endpoint: "", method: "" });
+}
+
+function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResources: boolean, hasDapr: boolean, hasCron: boolean, hasEvents: boolean): K8sManifest {
   const labels = { app: svc.name };
   const replicas = svc.scale?.min ?? 1;
 
@@ -36,7 +52,7 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
     ? Object.entries(svc.env).map(([name, value]) => ({ name, value }))
     : [];
 
-  if (hasMaps) {
+  if (hasMaps || hasEvents) {
     envEntries.push({ name: "VALKEY_URL", value: "valkey://valkey:6379" });
   }
   if (hasSecretResources) {
@@ -44,17 +60,24 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
     envEntries.push({ name: "OPENBAO_TOKEN", value: "dev-root-token" });
     envEntries.push({ name: "OPENBAO_SECRETS", value: JSON.stringify(getSecretNames(app)) });
   }
-  // Note: cron job registration is handled by the CLI at deploy time,
-  // not by the app at startup. No DAPR_CRON_JOBS env var needed.
+  if (hasDapr) {
+    envEntries.push({ name: "II_APP_PORT", value: String(svc.port) });
+  }
+  if (hasEvents) {
+    envEntries.push({ name: "II_EVENTS_MANIFEST", value: JSON.stringify(getEventsManifest(app)) });
+  }
+  if (hasCron) {
+    envEntries.push({ name: "II_CRON_JOBS", value: JSON.stringify(getCronJobsManifest(app)) });
+  }
 
   const env = envEntries.length > 0 ? envEntries : undefined;
 
   const templateMetadata: Record<string, unknown> = { labels };
-  if (hasCron) {
+  if (hasDapr) {
     templateMetadata.annotations = {
       "dapr.io/enabled": "true",
       "dapr.io/app-id": svc.name,
-      "dapr.io/app-port": String(svc.port),
+      "dapr.io/app-port": "3501",
     };
   }
 
@@ -216,14 +239,31 @@ function makeDaprStateStoreComponent(): K8sManifest {
   };
 }
 
+function makeDaprPubsubComponent(): K8sManifest {
+  return {
+    apiVersion: "dapr.io/v1alpha1",
+    kind: "Component",
+    metadata: { name: "ii-pubsub" },
+    spec: {
+      type: "pubsub.redis",
+      version: "v1",
+      metadata: [
+        { name: "redisHost", value: "valkey:6379" },
+      ],
+    },
+  };
+}
+
 export function compileToK8s(app: App): string {
   const manifests: K8sManifest[] = [];
   const hasMaps = hasDurableMaps(app);
   const hasSecretResources = hasSecrets(app);
   const hasCron = hasCronJobs(app);
+  const hasEvents = hasEventEmitters(app);
+  const hasDapr = hasCron || hasEvents;
 
   for (const svc of app.services) {
-    manifests.push(makeDeployment(app, svc, hasMaps, hasSecretResources, hasCron));
+    manifests.push(makeDeployment(app, svc, hasMaps, hasSecretResources, hasDapr, hasCron, hasEvents));
     manifests.push(makeService(svc));
 
     if (svc.ingress?.length) {
@@ -231,7 +271,7 @@ export function compileToK8s(app: App): string {
     }
   }
 
-  if (hasMaps) {
+  if (hasMaps || hasEvents) {
     manifests.push(makeValkeyDeployment());
     manifests.push(makeValkeyService());
   }
@@ -243,6 +283,10 @@ export function compileToK8s(app: App): string {
 
   if (hasCron) {
     manifests.push(makeDaprStateStoreComponent());
+  }
+
+  if (hasEvents) {
+    manifests.push(makeDaprPubsubComponent());
   }
 
   return manifests.map((m) => stringify(m)).join("---\n");

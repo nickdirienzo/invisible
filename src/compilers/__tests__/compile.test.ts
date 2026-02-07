@@ -370,14 +370,25 @@ describe("compileToCompose with cron jobs", () => {
     expect(doc.services["dapr-placement"].image).toBe("daprio/dapr:latest");
   });
 
-  it("does not inject DAPR_CRON_JOBS env var (reconciliation at deploy time)", () => {
+  it("injects II_APP_PORT and II_CRON_JOBS env vars", () => {
     const doc = parse(compileToCompose(cronApp));
+    expect(doc.services.web.environment.II_APP_PORT).toBe("3000");
+    const cronData = JSON.parse(doc.services.web.environment.II_CRON_JOBS);
+    expect(cronData).toEqual([{ name: "daily-report", endpoint: "/job/daily-report", method: "POST" }]);
     expect(doc.services.web.environment?.DAPR_CRON_JOBS).toBeUndefined();
   });
 
   it("exposes Dapr HTTP port for CLI reconciliation", () => {
     const doc = parse(compileToCompose(cronApp));
     expect(doc.services.web.ports).toContain("3500:3500");
+  });
+
+  it("Dapr sidecar uses app-port 3501 (II server)", () => {
+    const doc = parse(compileToCompose(cronApp));
+    const cmd = doc.services["web-dapr"].command;
+    expect(cmd).toContain("-app-port");
+    const portIdx = cmd.indexOf("-app-port");
+    expect(cmd[portIdx + 1]).toBe("3501");
   });
 
   it("Dapr sidecar depends on app and scheduler", () => {
@@ -388,7 +399,7 @@ describe("compileToCompose with cron jobs", () => {
 
   it("Dapr sidecar mounts components dir and state volume", () => {
     const doc = parse(compileToCompose(cronApp));
-    expect(doc.services["web-dapr"].volumes).toContain("./.ii/components:/components");
+    expect(doc.services["web-dapr"].volumes).toContain("./components:/components");
     expect(doc.services["web-dapr"].volumes).toContain("dapr-state:/state");
   });
 
@@ -418,10 +429,10 @@ describe("compileToK8s with cron jobs", () => {
     const annotations = webDeploy.spec.template.metadata.annotations;
     expect(annotations["dapr.io/enabled"]).toBe("true");
     expect(annotations["dapr.io/app-id"]).toBe("web");
-    expect(annotations["dapr.io/app-port"]).toBe("3000");
+    expect(annotations["dapr.io/app-port"]).toBe("3501");
   });
 
-  it("does not inject DAPR_CRON_JOBS env var (reconciliation at deploy time)", () => {
+  it("injects II_APP_PORT and II_CRON_JOBS env vars", () => {
     const docs = compileToK8s(cronApp)
       .split("---\n")
       .map((d) => parse(d));
@@ -430,7 +441,11 @@ describe("compileToK8s with cron jobs", () => {
       (d) => d.kind === "Deployment" && d.metadata.name === "web"
     );
     const env = webDeploy.spec.template.spec.containers[0].env;
-    expect(env).toBeUndefined();
+    expect(env).toContainEqual({ name: "II_APP_PORT", value: "3000" });
+    const cronEntry = env.find((e: { name: string }) => e.name === "II_CRON_JOBS");
+    expect(cronEntry).toBeDefined();
+    const cronData = JSON.parse(cronEntry.value);
+    expect(cronData).toEqual([{ name: "daily-report", endpoint: "/job/daily-report", method: "POST" }]);
   });
 
   it("does not add separate Dapr Deployment", () => {
@@ -458,10 +473,11 @@ describe("compileToK8s with cron jobs", () => {
 });
 
 describe("compileToDockerfile with cron jobs", () => {
-  it("does not include --import for cron shim (reconciliation at deploy time)", () => {
+  it("includes --import for II server", () => {
     const dockerfile = compileToDockerfile(cronApp.services[0], "node index.js", {
       hasCronJobs: true,
     });
+    expect(dockerfile).toContain("ii-server.mjs");
     expect(dockerfile).not.toContain("cron-shim.mjs");
   });
 
@@ -473,12 +489,218 @@ describe("compileToDockerfile with cron jobs", () => {
     expect(dockerfile).toContain("build.mjs");
   });
 
-  it("includes secrets shim import but not cron shim", () => {
+  it("copies runtime dir for II server", () => {
+    const dockerfile = compileToDockerfile(cronApp.services[0], "node index.js", {
+      hasCronJobs: true,
+    });
+    expect(dockerfile).toContain("COPY .ii/runtime ./.ii/runtime");
+  });
+
+  it("includes both II server and secrets shim imports", () => {
     const dockerfile = compileToDockerfile(cronApp.services[0], "node index.js", {
       hasSecrets: true,
       hasCronJobs: true,
     });
+    expect(dockerfile).toContain("ii-server.mjs");
     expect(dockerfile).toContain("secrets-shim.mjs");
-    expect(dockerfile).not.toContain("cron-shim.mjs");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Event emitter resources (Dapr pub/sub)
+// ---------------------------------------------------------------------------
+
+const eventsApp: App = {
+  name: "events-app",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "index.ts",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+    },
+  ],
+  resources: [
+    {
+      kind: "event-emitter",
+      name: "orders",
+      sourceFile: "index.ts",
+      events: ["order:created", "order:shipped"],
+    },
+  ],
+};
+
+describe("compileToCompose with events", () => {
+  it("adds Valkey for pub/sub", () => {
+    const doc = parse(compileToCompose(eventsApp));
+    expect(doc.services.valkey).toBeDefined();
+    expect(doc.services.valkey.image).toBe("valkey/valkey:8-alpine");
+  });
+
+  it("adds Dapr sidecar with app-port 3501", () => {
+    const doc = parse(compileToCompose(eventsApp));
+    expect(doc.services["web-dapr"]).toBeDefined();
+    const cmd = doc.services["web-dapr"].command;
+    expect(cmd).toContain("-app-port");
+    const portIdx = cmd.indexOf("-app-port");
+    expect(cmd[portIdx + 1]).toBe("3501");
+  });
+
+  it("does not add scheduler or placement (events only)", () => {
+    const doc = parse(compileToCompose(eventsApp));
+    expect(doc.services["dapr-scheduler"]).toBeUndefined();
+    expect(doc.services["dapr-placement"]).toBeUndefined();
+  });
+
+  it("injects VALKEY_URL, II_APP_PORT, and II_EVENTS_MANIFEST", () => {
+    const doc = parse(compileToCompose(eventsApp));
+    expect(doc.services.web.environment.VALKEY_URL).toBe("valkey://valkey:6379");
+    expect(doc.services.web.environment.II_APP_PORT).toBe("3000");
+    const manifest = JSON.parse(doc.services.web.environment.II_EVENTS_MANIFEST);
+    expect(manifest).toEqual([{ namespace: "orders", events: ["order:created", "order:shipped"] }]);
+  });
+
+  it("depends on valkey", () => {
+    const doc = parse(compileToCompose(eventsApp));
+    expect(doc.services.web.depends_on).toContain("valkey");
+  });
+});
+
+describe("compileToK8s with events", () => {
+  it("adds Dapr annotations with app-port 3501", () => {
+    const docs = compileToK8s(eventsApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const webDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "web"
+    );
+    const annotations = webDeploy.spec.template.metadata.annotations;
+    expect(annotations["dapr.io/enabled"]).toBe("true");
+    expect(annotations["dapr.io/app-port"]).toBe("3501");
+  });
+
+  it("adds Valkey and pub/sub Component", () => {
+    const docs = compileToK8s(eventsApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const valkeyDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "valkey"
+    );
+    expect(valkeyDeploy).toBeDefined();
+
+    const pubsub = docs.find(
+      (d) => d.kind === "Component" && d.metadata.name === "ii-pubsub"
+    );
+    expect(pubsub).toBeDefined();
+    expect(pubsub.spec.type).toBe("pubsub.redis");
+  });
+
+  it("does not add state store Component (events only)", () => {
+    const docs = compileToK8s(eventsApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const stateStore = docs.find(
+      (d) => d.kind === "Component" && d.metadata.name === "ii-state"
+    );
+    expect(stateStore).toBeUndefined();
+  });
+
+  it("injects events env vars", () => {
+    const docs = compileToK8s(eventsApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const webDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "web"
+    );
+    const env = webDeploy.spec.template.spec.containers[0].env;
+    expect(env).toContainEqual({ name: "VALKEY_URL", value: "valkey://valkey:6379" });
+    expect(env).toContainEqual({ name: "II_APP_PORT", value: "3000" });
+    const eventsEntry = env.find((e: { name: string }) => e.name === "II_EVENTS_MANIFEST");
+    expect(eventsEntry).toBeDefined();
+  });
+});
+
+describe("compileToDockerfile with events", () => {
+  it("includes --import for II server", () => {
+    const dockerfile = compileToDockerfile(eventsApp.services[0], "node index.js", {
+      hasEvents: true,
+    });
+    expect(dockerfile).toContain("ii-server.mjs");
+  });
+
+  it("copies events.json in build stage", () => {
+    const dockerfile = compileToDockerfile(eventsApp.services[0], "node index.js", {
+      hasEvents: true,
+    });
+    expect(dockerfile).toContain("events.json");
+    expect(dockerfile).toContain("build.mjs");
+  });
+
+  it("copies runtime dir", () => {
+    const dockerfile = compileToDockerfile(eventsApp.services[0], "node index.js", {
+      hasEvents: true,
+    });
+    expect(dockerfile).toContain("COPY .ii/runtime ./.ii/runtime");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mixed cron + events
+// ---------------------------------------------------------------------------
+
+const mixedDaprApp: App = {
+  name: "mixed-dapr",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "index.ts",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+    },
+  ],
+  resources: [
+    {
+      kind: "cron-job",
+      name: "cleanup",
+      endpoint: "/cleanup",
+      method: "POST",
+      intervalMs: 3600000,
+      sourceFile: "index.ts",
+    },
+    {
+      kind: "event-emitter",
+      name: "bus",
+      sourceFile: "index.ts",
+      events: ["notify"],
+    },
+  ],
+};
+
+describe("compileToCompose with cron + events", () => {
+  it("has single Valkey, single Dapr sidecar", () => {
+    const doc = parse(compileToCompose(mixedDaprApp));
+    expect(doc.services.valkey).toBeDefined();
+    expect(doc.services["web-dapr"]).toBeDefined();
+  });
+
+  it("has scheduler for cron", () => {
+    const doc = parse(compileToCompose(mixedDaprApp));
+    expect(doc.services["dapr-scheduler"]).toBeDefined();
+  });
+
+  it("injects all Dapr env vars", () => {
+    const doc = parse(compileToCompose(mixedDaprApp));
+    expect(doc.services.web.environment.II_APP_PORT).toBe("3000");
+    expect(doc.services.web.environment.II_CRON_JOBS).toBeDefined();
+    expect(doc.services.web.environment.II_EVENTS_MANIFEST).toBeDefined();
+    expect(doc.services.web.environment.VALKEY_URL).toBe("valkey://valkey:6379");
   });
 });
