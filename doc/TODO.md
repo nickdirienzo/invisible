@@ -30,3 +30,9 @@ other instances remain subscribed. A true cluster-wide `.once` (fire globally
 once, then unsubscribe everywhere) would need coordination (e.g. a Valkey key
 to track consumption and dynamic Dapr topic unsubscription). Open question
 whether that's worth the complexity or if local `.once` is sufficient.
+
+## Global types
+`new Map` as Durable
+Use `{}` as a fallback to in-memory map
+`new Array` as Durable
+Use `[]` as in-memory array
