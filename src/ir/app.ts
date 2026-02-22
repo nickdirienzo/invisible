@@ -65,4 +65,21 @@ export interface EnvVarResource {
   sourceFile: string;
 }
 
-export type Resource = DurableMapResource | SecretResource | CronJobResource | EventEmitterResource | EnvVarResource;
+export interface CapabilityImportResource {
+  kind: "capability-import";
+  /** Raw import module specifier, e.g. "pg", "better-sqlite3", "@prisma/client" */
+  module: string;
+  capability: "relational" | "relational-embedded" | "document" | "kv" | "relational-compatible";
+  engine: "postgres" | "mysql" | "sqlite" | "mongodb" | "valkey" | "libsql" | "planetscale" | null;
+  /** replace: grammar provisions the engine. preserve: grammar provisions compute + volume, keeps the engine. */
+  provisioning: "replace" | "preserve";
+  sourceFile: string;
+  name: string;
+  /** Present for ORM imports where the engine is resolved indirectly */
+  deferred?: {
+    source: "prisma.schema" | "co-import";
+    resolved: boolean;
+  };
+}
+
+export type Resource = DurableMapResource | SecretResource | CronJobResource | EventEmitterResource | EnvVarResource | CapabilityImportResource;
