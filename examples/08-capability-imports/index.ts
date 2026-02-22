@@ -12,6 +12,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 // Redis — capability-import detects "redis" as kv/valkey (replace).
 // II will provision a Valkey instance.
 const cache = createClient({ url: process.env.REDIS_URL });
+await cache.connect();
 
 app.get("/users", async (req, res) => {
   const cacheKey = "users:all";

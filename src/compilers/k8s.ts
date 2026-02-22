@@ -112,10 +112,6 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
     envEntries.push({ name: "OPENBAO_ADDR", value: "http://openbao:8200" });
     envEntries.push({ name: "OPENBAO_TOKEN", value: "dev-root-token" });
     envEntries.push({ name: "OPENBAO_SECRETS", value: JSON.stringify(getSecretNames(app)) });
-    const seeds = getSecretSeeds(app);
-    if (Object.keys(seeds).length > 0) {
-      envEntries.push({ name: "II_SECRET_SEEDS", value: JSON.stringify(seeds) });
-    }
   }
   if (hasDapr) {
     envEntries.push({ name: "II_APP_PORT", value: String(svc.port) });
@@ -138,6 +134,25 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
     };
   }
 
+  const initContainers: Record<string, unknown>[] = [];
+  if (hasSecretResources) {
+    const seeds = getSecretSeeds(app);
+    const initEnv = [
+      { name: "OPENBAO_ADDR", value: "http://openbao:8200" },
+      { name: "OPENBAO_TOKEN", value: "dev-root-token" },
+      { name: "OPENBAO_SECRETS", value: JSON.stringify(getSecretNames(app)) },
+    ];
+    if (Object.keys(seeds).length > 0) {
+      initEnv.push({ name: "II_SECRET_SEEDS", value: JSON.stringify(seeds) });
+    }
+    initContainers.push({
+      name: "vault-init",
+      image: "node:22-slim",
+      command: ["node", "/app/vault-seed.mjs"],
+      env: initEnv,
+    });
+  }
+
   return {
     apiVersion: "apps/v1",
     kind: "Deployment",
@@ -148,6 +163,7 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
       template: {
         metadata: templateMetadata,
         spec: {
+          ...(initContainers.length > 0 ? { initContainers } : {}),
           containers: [
             {
               name: svc.name,
