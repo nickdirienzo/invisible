@@ -140,7 +140,7 @@ function getProvisionedEngines(resources: Resource[]): EngineConfig[] {
   return engines;
 }
 
-/** Build II_SECRET_SEEDS: maps secret names to connection strings for provisioned engines. */
+/** Map secret names to connection strings for provisioned engines. */
 function getSecretSeeds(resources: Resource[]): Record<string, string> {
   const seeds: Record<string, string> = {};
   const seen = new Set<string>();
@@ -216,9 +216,6 @@ export function compileToCompose(app: App): string {
       env.OPENBAO_ADDR = "http://openbao:8200";
       env.OPENBAO_TOKEN = "dev-root-token";
       env.OPENBAO_SECRETS = JSON.stringify(getSecretNames(svcResources));
-      if (Object.keys(svcSecretSeeds).length > 0) {
-        env.II_SECRET_SEEDS = JSON.stringify(svcSecretSeeds);
-      }
     }
     if (svcHasDapr) {
       env.II_APP_PORT = String(svc.port);
@@ -237,7 +234,7 @@ export function compileToCompose(app: App): string {
     // Cron jobs need Valkey too — the Dapr state store (used for job
     // reconciliation) is backed by Valkey instead of SQLite.
     if (svcHasMaps || svcHasEvents || svcHasCron) deps.push("valkey");
-    if (svcHasSecrets) deps.push("openbao");
+    if (svcHasSecrets) deps.push("vault-init");
     for (const eng of svcEngines) {
       if (!deps.includes(eng.service)) deps.push(eng.service);
     }
@@ -302,6 +299,23 @@ export function compileToCompose(app: App): string {
         BAO_DEV_ROOT_TOKEN_ID: "dev-root-token",
         BAO_DEV_LISTEN_ADDRESS: "0.0.0.0:8200",
       },
+    };
+
+    const allSecretNames = getSecretNames(app.resources ?? []);
+    const initEnv: Record<string, string> = {
+      OPENBAO_ADDR: "http://openbao:8200",
+      OPENBAO_TOKEN: "dev-root-token",
+      OPENBAO_SECRETS: JSON.stringify(allSecretNames),
+    };
+    if (Object.keys(appSecretSeeds).length > 0) {
+      initEnv.II_SECRET_SEEDS = JSON.stringify(appSecretSeeds);
+    }
+    compose.services["vault-init"] = {
+      image: "node:22-slim",
+      environment: initEnv,
+      depends_on: ["openbao"],
+      volumes: ["./runtime/vault-seed.mjs:/app/vault-seed.mjs:ro"],
+      command: ["node", "/app/vault-seed.mjs"],
     };
   }
 
