@@ -1,5 +1,58 @@
 import { stringify } from "yaml";
-import type { App, Service, EventEmitterResource } from "../ir/index.js";
+import type { App, Service, EventEmitterResource, CapabilityImportResource } from "../ir/index.js";
+
+// ---------------------------------------------------------------------------
+// Engine provisioning config for capability-import resources
+// ---------------------------------------------------------------------------
+
+interface EngineK8sConfig {
+  name: string;
+  image: string;
+  port: number;
+  connectionUrl: string;
+  secretName: string;
+  env?: Array<{ name: string; value: string }>;
+}
+
+const ENGINE_K8S: Record<string, EngineK8sConfig> = {
+  postgres: {
+    name: "postgres",
+    image: "postgres:17-alpine",
+    port: 5432,
+    connectionUrl: "postgres://postgres:postgres@postgres:5432/app",
+    secretName: "DATABASE_URL",
+    env: [
+      { name: "POSTGRES_USER", value: "postgres" },
+      { name: "POSTGRES_PASSWORD", value: "postgres" },
+      { name: "POSTGRES_DB", value: "app" },
+    ],
+  },
+  mysql: {
+    name: "mysql",
+    image: "mysql:8",
+    port: 3306,
+    connectionUrl: "mysql://root:root@mysql:3306/app",
+    secretName: "DATABASE_URL",
+    env: [
+      { name: "MYSQL_ROOT_PASSWORD", value: "root" },
+      { name: "MYSQL_DATABASE", value: "app" },
+    ],
+  },
+  mongodb: {
+    name: "mongodb",
+    image: "mongo:7",
+    port: 27017,
+    connectionUrl: "mongodb://mongodb:27017/app",
+    secretName: "MONGODB_URL",
+  },
+  valkey: {
+    name: "valkey",
+    image: "valkey/valkey:8-alpine",
+    port: 6379,
+    connectionUrl: "redis://valkey:6379",
+    secretName: "REDIS_URL",
+  },
+};
 
 interface K8sManifest {
   apiVersion: string;
@@ -59,6 +112,10 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
     envEntries.push({ name: "OPENBAO_ADDR", value: "http://openbao:8200" });
     envEntries.push({ name: "OPENBAO_TOKEN", value: "dev-root-token" });
     envEntries.push({ name: "OPENBAO_SECRETS", value: JSON.stringify(getSecretNames(app)) });
+    const seeds = getSecretSeeds(app);
+    if (Object.keys(seeds).length > 0) {
+      envEntries.push({ name: "II_SECRET_SEEDS", value: JSON.stringify(seeds) });
+    }
   }
   if (hasDapr) {
     envEntries.push({ name: "II_APP_PORT", value: String(svc.port) });
@@ -239,6 +296,69 @@ function makeDaprStateStoreComponent(): K8sManifest {
   };
 }
 
+/** Collect unique provisioned engines from capability-import resources. */
+function getProvisionedEngines(app: App): EngineK8sConfig[] {
+  const seen = new Set<string>();
+  const engines: EngineK8sConfig[] = [];
+  for (const r of (app.resources ?? [])) {
+    if (r.kind !== "capability-import") continue;
+    const cap = r as CapabilityImportResource;
+    if (cap.provisioning !== "replace" || !cap.engine) continue;
+    const cfg = ENGINE_K8S[cap.engine];
+    if (cfg && !seen.has(cap.engine)) {
+      seen.add(cap.engine);
+      engines.push(cfg);
+    }
+  }
+  return engines;
+}
+
+/** Build II_SECRET_SEEDS: maps secret names to connection strings for provisioned engines. */
+function getSecretSeeds(app: App): Record<string, string> {
+  const seeds: Record<string, string> = {};
+  for (const eng of getProvisionedEngines(app)) {
+    seeds[eng.secretName] = eng.connectionUrl;
+  }
+  return seeds;
+}
+
+function makeEngineDeployment(cfg: EngineK8sConfig): K8sManifest {
+  const labels = { app: cfg.name };
+  const container: Record<string, unknown> = {
+    name: cfg.name,
+    image: cfg.image,
+    ports: [{ containerPort: cfg.port }],
+  };
+  if (cfg.env) container.env = cfg.env;
+  return {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: { name: cfg.name, labels },
+    spec: {
+      replicas: 1,
+      selector: { matchLabels: labels },
+      template: {
+        metadata: { labels },
+        spec: {
+          containers: [container],
+        },
+      },
+    },
+  };
+}
+
+function makeEngineService(cfg: EngineK8sConfig): K8sManifest {
+  return {
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name: cfg.name },
+    spec: {
+      selector: { app: cfg.name },
+      ports: [{ port: cfg.port, targetPort: cfg.port }],
+    },
+  };
+}
+
 function makeDaprPubsubComponent(): K8sManifest {
   return {
     apiVersion: "dapr.io/v1alpha1",
@@ -261,6 +381,8 @@ export function compileToK8s(app: App): string {
   const hasCron = hasCronJobs(app);
   const hasEvents = hasEventEmitters(app);
   const hasDapr = hasCron || hasEvents;
+  const engines = getProvisionedEngines(app);
+  const needsValkey = hasMaps || hasEvents || hasCron || engines.some((e) => e.name === "valkey");
 
   for (const svc of app.services) {
     manifests.push(makeDeployment(app, svc, hasMaps, hasSecretResources, hasDapr, hasCron, hasEvents));
@@ -271,9 +393,16 @@ export function compileToK8s(app: App): string {
     }
   }
 
-  if (hasMaps || hasEvents || hasCron) {
+  if (needsValkey) {
     manifests.push(makeValkeyDeployment());
     manifests.push(makeValkeyService());
+  }
+
+  // Database engines provisioned from capability-import resources.
+  for (const eng of engines) {
+    if (eng.name === "valkey") continue; // handled above
+    manifests.push(makeEngineDeployment(eng));
+    manifests.push(makeEngineService(eng));
   }
 
   if (hasSecretResources) {

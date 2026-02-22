@@ -963,12 +963,16 @@ const token = process.env.OPENBAO_TOKEN;
 const secretNames = JSON.parse(process.env.OPENBAO_SECRETS || "[]");
 
 if (addr && token && secretNames.length > 0) {
-  // Seed each secret with a dev placeholder (idempotent — overwrites on each start)
+  // Seed each secret (idempotent — overwrites on each start).
+  // II_SECRET_SEEDS provides real connection strings for provisioned engines;
+  // other secrets get a dev placeholder.
+  const seeds = JSON.parse(process.env.II_SECRET_SEEDS || "{}");
   for (const name of secretNames) {
+    const seedValue = seeds[name] ?? \`\${name}-dev-value\`;
     await fetch(\`\${addr}/v1/secret/data/\${name}\`, {
       method: "PUT",
       headers: { "X-Vault-Token": token, "Content-Type": "application/json" },
-      body: JSON.stringify({ data: { value: \`\${name}-dev-value\` } }),
+      body: JSON.stringify({ data: { value: seedValue } }),
     }).catch(() => {});
   }
 
