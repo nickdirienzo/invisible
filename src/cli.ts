@@ -146,6 +146,21 @@ function doPlan(projectDir: string) {
         }
       }
     }
+
+    const capImports = app.resources.filter((r) => r.kind === "capability-import");
+    if (capImports.length > 0) {
+      console.log(`\n  databases:`);
+      for (const r of capImports) {
+        if (r.kind === "capability-import") {
+          const engine = r.engine ?? "unresolved";
+          const prov = r.provisioning === "preserve" ? " [preserve]" : "";
+          const def = r.deferred
+            ? ` (deferred → ${r.deferred.source}, ${r.deferred.resolved ? "resolved" : "unresolved"})`
+            : "";
+          console.log(`    ${r.module} → ${engine} (${r.capability})${prov}${def} (${r.sourceFile})`);
+        }
+      }
+    }
   }
 
   // Show inferred infrastructure
@@ -160,7 +175,19 @@ function doPlan(projectDir: string) {
   if (hasSecretResources) infra.push("openbao");
   if (hasDapr) infra.push("dapr");
 
-  if (infra.length > 0) {
+  const replaceEngines = [...new Set(
+    (app.resources ?? [])
+      .filter((r) => r.kind === "capability-import" && r.engine && r.provisioning === "replace")
+      .map((r) => r.kind === "capability-import" ? r.engine : null)
+      .filter(Boolean) as string[]
+  )];
+  for (const engine of replaceEngines) infra.push(engine);
+
+  const hasPreservedDb = (app.resources ?? []).some(
+    (r) => r.kind === "capability-import" && r.provisioning === "preserve"
+  );
+
+  if (infra.length > 0 || hasPreservedDb) {
     console.log(`\n  infrastructure:`);
     if (hasMaps) console.log(`    valkey — durable map backend`);
     if (hasEvents && !hasMaps) console.log(`    valkey — pub/sub backend`);
@@ -169,6 +196,8 @@ function doPlan(projectDir: string) {
     if (hasCron && hasEvents) console.log(`    dapr — job scheduling + pub/sub`);
     else if (hasCron) console.log(`    dapr — job scheduling`);
     else if (hasEvents) console.log(`    dapr — pub/sub`);
+    for (const engine of replaceEngines) console.log(`    ${engine} — database`);
+    if (hasPreservedDb) console.log(`    volume — persistent storage (embedded database)`);
   }
 
   console.log(`\nPlan written to ${II_DIR}/${PLAN_FILE}`);
