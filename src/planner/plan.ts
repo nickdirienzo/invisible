@@ -2,7 +2,7 @@ import { readdirSync } from "node:fs";
 import { readFileSync } from "node:fs";
 import { join, basename } from "node:path";
 import ts from "typescript";
-import type { App, Resource } from "../ir/index.js";
+import type { App, Resource, CapabilityImportResource } from "../ir/index.js";
 
 interface PackageJson {
   name?: string;
@@ -37,6 +37,7 @@ function planService(
   const envVars = detectEnvVars(program, serviceDir, sourceFiles);
   const cronJobs = detectCronJobs(program, serviceDir, sourceFiles);
   const eventEmitters = detectEventEmitters(program, serviceDir, sourceFiles);
+  const capabilityImports = detectCapabilityImports(program, serviceDir, sourceFiles);
   const resources: Resource[] = [
     ...durableMaps.map((m) => ({
       kind: "durable-map" as const,
@@ -66,6 +67,16 @@ function planService(
       name: e.name,
       sourceFile: e.file,
       events: e.events,
+    })),
+    ...capabilityImports.map((c) => ({
+      kind: "capability-import" as const,
+      module: c.module,
+      capability: c.capability,
+      engine: c.engine,
+      provisioning: c.provisioning,
+      sourceFile: c.file,
+      name: c.engine ?? c.module,
+      ...(c.deferred ? { deferred: c.deferred } : {}),
     })),
   ];
 
@@ -927,4 +938,235 @@ function extractEventNames(sourceFile: ts.SourceFile, varName: string): string[]
 
   visit(sourceFile);
   return [...events];
+}
+
+// ---------------------------------------------------------------------------
+// Capability import detection — database driver imports (Signal 4)
+// ---------------------------------------------------------------------------
+
+interface DriverMapping {
+  capability: CapabilityImportResource["capability"];
+  engine: NonNullable<CapabilityImportResource["engine"]>;
+  provisioning: "replace" | "preserve";
+}
+
+/**
+ * Known database driver packages → infrastructure requirements.
+ * The import existing at all is the signal — we don't infer, we read.
+ */
+const DRIVER_MAP: Record<string, DriverMapping> = {
+  "better-sqlite3":            { capability: "relational-embedded",   engine: "sqlite",      provisioning: "preserve" },
+  "node:sqlite":               { capability: "relational-embedded",   engine: "sqlite",      provisioning: "preserve" },
+  "sqlite":                    { capability: "relational-embedded",   engine: "sqlite",      provisioning: "preserve" },
+  "pg":                        { capability: "relational",            engine: "postgres",    provisioning: "replace" },
+  "postgres":                  { capability: "relational",            engine: "postgres",    provisioning: "replace" },
+  "@neondatabase/serverless":  { capability: "relational",            engine: "postgres",    provisioning: "replace" },
+  "mysql2":                    { capability: "relational",            engine: "mysql",       provisioning: "replace" },
+  "mysql":                     { capability: "relational",            engine: "mysql",       provisioning: "replace" },
+  "mongodb":                   { capability: "document",              engine: "mongodb",     provisioning: "replace" },
+  "mongoose":                  { capability: "document",              engine: "mongodb",     provisioning: "replace" },
+  "@planetscale/database":     { capability: "relational-compatible", engine: "planetscale", provisioning: "replace" },
+  "@libsql/client":            { capability: "relational-compatible", engine: "libsql",      provisioning: "replace" },
+  "@turso/client":             { capability: "relational-compatible", engine: "libsql",      provisioning: "replace" },
+  "redis":                     { capability: "kv",                    engine: "valkey",      provisioning: "replace" },
+  "ioredis":                   { capability: "kv",                    engine: "valkey",      provisioning: "replace" },
+};
+
+/** ORM packages that require deferred resolution to determine the actual engine. */
+const DEFERRED_DRIVERS: Record<string, "prisma.schema" | "co-import"> = {
+  "@prisma/client": "prisma.schema",
+  "drizzle-orm":    "co-import",
+};
+
+/** All module names we scan for (direct + deferred). */
+const ALL_DRIVER_MODULES = new Set([
+  ...Object.keys(DRIVER_MAP),
+  ...Object.keys(DEFERRED_DRIVERS),
+]);
+
+interface CapabilityImportDetection {
+  module: string;
+  capability: CapabilityImportResource["capability"];
+  engine: CapabilityImportResource["engine"];
+  provisioning: "replace" | "preserve";
+  file: string;
+  deferred?: {
+    source: "prisma.schema" | "co-import";
+    resolved: boolean;
+  };
+}
+
+/**
+ * Scan all source files for import declarations matching known database driver
+ * packages. The import itself is the infrastructure declaration.
+ *
+ * For ORMs:
+ *   - @prisma/client → read prisma/schema.prisma datasource provider
+ *   - drizzle-orm → detect co-imported direct driver in the same project
+ */
+function detectCapabilityImports(
+  program: ts.Program,
+  projectDir: string,
+  files: string[]
+): CapabilityImportDetection[] {
+  // Phase 1: collect all matching imports across all source files
+  const rawImports = findImportedModules(program, projectDir, files, ALL_DRIVER_MODULES);
+
+  // Phase 2: dedup by module (first source file wins)
+  const seen = new Set<string>();
+  const dedupedImports: Array<{ module: string; file: string }> = [];
+  for (const imp of rawImports) {
+    if (!seen.has(imp.module)) {
+      seen.add(imp.module);
+      dedupedImports.push(imp);
+    }
+  }
+
+  // Phase 3: resolve direct drivers
+  const results: CapabilityImportDetection[] = [];
+  const directDrivers: CapabilityImportDetection[] = [];
+
+  for (const imp of dedupedImports) {
+    const mapping = DRIVER_MAP[imp.module];
+    if (mapping) {
+      const detection: CapabilityImportDetection = {
+        module: imp.module,
+        capability: mapping.capability,
+        engine: mapping.engine,
+        provisioning: mapping.provisioning,
+        file: imp.file,
+      };
+      results.push(detection);
+      directDrivers.push(detection);
+      continue;
+    }
+
+    const deferredSource = DEFERRED_DRIVERS[imp.module];
+    if (deferredSource === "prisma.schema") {
+      results.push(resolvePrisma(imp, projectDir));
+    } else if (deferredSource === "co-import") {
+      // Drizzle resolved after all imports are collected
+    }
+  }
+
+  // Phase 4: resolve Drizzle co-import (needs the full directDrivers list)
+  for (const imp of dedupedImports) {
+    if (DEFERRED_DRIVERS[imp.module] === "co-import") {
+      results.push(resolveDrizzle(imp, directDrivers));
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Scan source files for import declarations matching any module in the given set.
+ * We only care about the module specifier — not what's imported from it.
+ */
+function findImportedModules(
+  program: ts.Program,
+  projectDir: string,
+  files: string[],
+  moduleNames: Set<string>
+): Array<{ module: string; file: string }> {
+  const results: Array<{ module: string; file: string }> = [];
+
+  for (const file of files) {
+    const sourceFile = program.getSourceFile(join(projectDir, file));
+    if (!sourceFile) continue;
+
+    for (const statement of sourceFile.statements) {
+      if (
+        ts.isImportDeclaration(statement) &&
+        ts.isStringLiteral(statement.moduleSpecifier)
+      ) {
+        const mod = statement.moduleSpecifier.text;
+        if (moduleNames.has(mod)) {
+          results.push({ module: mod, file });
+        }
+      }
+    }
+  }
+
+  return results;
+}
+
+/** Prisma provider name → engine mapping */
+const PRISMA_PROVIDER_MAP: Record<string, DriverMapping> = {
+  "postgresql": { capability: "relational",          engine: "postgres", provisioning: "replace" },
+  "postgres":   { capability: "relational",          engine: "postgres", provisioning: "replace" },
+  "mysql":      { capability: "relational",          engine: "mysql",    provisioning: "replace" },
+  "sqlite":     { capability: "relational-embedded", engine: "sqlite",   provisioning: "preserve" },
+  "mongodb":    { capability: "document",            engine: "mongodb",  provisioning: "replace" },
+};
+
+/**
+ * Resolve @prisma/client by reading prisma/schema.prisma and extracting
+ * the datasource provider field.
+ */
+function resolvePrisma(
+  imp: { module: string; file: string },
+  projectDir: string
+): CapabilityImportDetection {
+  try {
+    const schemaPath = join(projectDir, "prisma", "schema.prisma");
+    const schema = readFileSync(schemaPath, "utf-8");
+    const match = schema.match(/datasource\s+\w+\s*\{[^}]*provider\s*=\s*"(\w+)"/s);
+    if (match) {
+      const provider = match[1];
+      const mapping = PRISMA_PROVIDER_MAP[provider];
+      if (mapping) {
+        return {
+          module: imp.module,
+          capability: mapping.capability,
+          engine: mapping.engine,
+          provisioning: mapping.provisioning,
+          file: imp.file,
+          deferred: { source: "prisma.schema", resolved: true },
+        };
+      }
+    }
+  } catch {
+    // Schema file not found or unreadable — emit unresolved
+  }
+
+  return {
+    module: imp.module,
+    capability: "relational",
+    engine: null,
+    provisioning: "replace",
+    file: imp.file,
+    deferred: { source: "prisma.schema", resolved: false },
+  };
+}
+
+/**
+ * Resolve drizzle-orm by checking if a direct database driver was co-imported
+ * in the same project. Drizzle always imports alongside a driver.
+ */
+function resolveDrizzle(
+  imp: { module: string; file: string },
+  directDrivers: CapabilityImportDetection[]
+): CapabilityImportDetection {
+  // Use the first direct driver found as the resolution
+  if (directDrivers.length > 0) {
+    const driver = directDrivers[0];
+    return {
+      module: imp.module,
+      capability: driver.capability,
+      engine: driver.engine,
+      provisioning: driver.provisioning,
+      file: imp.file,
+      deferred: { source: "co-import", resolved: true },
+    };
+  }
+
+  return {
+    module: imp.module,
+    capability: "relational",
+    engine: null,
+    provisioning: "replace",
+    file: imp.file,
+    deferred: { source: "co-import", resolved: false },
+  };
 }
