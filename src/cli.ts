@@ -339,6 +339,7 @@ async function doDeployLocal({ projectDir, planFile, noCache }: DeployOpts) {
 
   if (hasSecretResources) {
     writeSecretsShim(out);
+    writeVaultSeed(out);
   }
 
   if (hasCron) {
@@ -567,6 +568,7 @@ function doDeployK8s({ projectDir, planFile }: DeployOpts) {
 
   if (hasSecretResources) {
     writeSecretsShim(out);
+    writeVaultSeed(out);
   }
 
   if (hasCron) {
@@ -947,36 +949,18 @@ export class DurableMap {
 /**
  * Write .ii/runtime/secrets-shim.mjs — a Node --import hook that fetches
  * secrets from OpenBao and populates process.env before the app starts.
- * Uses Node 22's built-in fetch(), no npm dependencies needed.
+ * Secrets are seeded by the vault-init service, not the app itself.
  */
 function writeSecretsShim(out: string) {
   const runtimeDir = join(out, "runtime");
   mkdirSync(runtimeDir, { recursive: true });
 
   writeFileSync(join(runtimeDir, "secrets-shim.mjs"), `\
-// Secrets shim — runs via node --import before the app starts.
-// Reads secret names from OPENBAO_SECRETS, seeds dev values,
-// then fetches from OpenBao and populates process.env.
-
 const addr = process.env.OPENBAO_ADDR;
 const token = process.env.OPENBAO_TOKEN;
 const secretNames = JSON.parse(process.env.OPENBAO_SECRETS || "[]");
 
 if (addr && token && secretNames.length > 0) {
-  // Seed each secret (idempotent — overwrites on each start).
-  // II_SECRET_SEEDS provides real connection strings for provisioned engines;
-  // other secrets get a dev placeholder.
-  const seeds = JSON.parse(process.env.II_SECRET_SEEDS || "{}");
-  for (const name of secretNames) {
-    const seedValue = seeds[name] ?? \`\${name}-dev-value\`;
-    await fetch(\`\${addr}/v1/secret/data/\${name}\`, {
-      method: "PUT",
-      headers: { "X-Vault-Token": token, "Content-Type": "application/json" },
-      body: JSON.stringify({ data: { value: seedValue } }),
-    }).catch(() => {});
-  }
-
-  // Fetch each secret and populate process.env
   for (const name of secretNames) {
     try {
       const res = await fetch(\`\${addr}/v1/secret/data/\${name}\`, {
@@ -991,6 +975,45 @@ if (addr && token && secretNames.length > 0) {
     }
   }
 }
+`);
+}
+
+function writeVaultSeed(out: string) {
+  const runtimeDir = join(out, "runtime");
+  mkdirSync(runtimeDir, { recursive: true });
+
+  writeFileSync(join(runtimeDir, "vault-seed.mjs"), `\
+const addr = process.env.OPENBAO_ADDR;
+const token = process.env.OPENBAO_TOKEN;
+const secretNames = JSON.parse(process.env.OPENBAO_SECRETS || "[]");
+const seeds = JSON.parse(process.env.II_SECRET_SEEDS || "{}");
+
+async function waitForVault() {
+  for (let i = 0; i < 30; i++) {
+    try {
+      const res = await fetch(\`\${addr}/v1/sys/health\`);
+      if (res.ok) return;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new Error("OpenBao did not become ready");
+}
+
+await waitForVault();
+
+for (const name of secretNames) {
+  const seedValue = seeds[name] ?? \`\${name}-dev-value\`;
+  const res = await fetch(\`\${addr}/v1/secret/data/\${name}\`, {
+    method: "PUT",
+    headers: { "X-Vault-Token": token, "Content-Type": "application/json" },
+    body: JSON.stringify({ data: { value: seedValue } }),
+  });
+  if (!res.ok) {
+    console.error(\`Failed to seed \${name}: \${res.status}\`);
+  }
+}
+
+console.log(\`Seeded \${secretNames.length} secret(s) into OpenBao\`);
 `);
 }
 

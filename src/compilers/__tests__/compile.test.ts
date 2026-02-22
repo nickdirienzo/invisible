@@ -206,9 +206,21 @@ describe("compileToCompose with secrets", () => {
     expect(secrets).toEqual(["STRIPE_API_KEY", "DATABASE_URL"]);
   });
 
-  it("adds depends_on for openbao", () => {
+  it("adds depends_on for vault-init", () => {
     const doc = parse(compileToCompose(secretApp));
-    expect(doc.services.web.depends_on).toContain("openbao");
+    expect(doc.services.web.depends_on).toContain("vault-init");
+  });
+
+  it("adds vault-init service that depends on openbao", () => {
+    const doc = parse(compileToCompose(secretApp));
+    expect(doc.services["vault-init"]).toBeDefined();
+    expect(doc.services["vault-init"].depends_on).toContain("openbao");
+    expect(doc.services["vault-init"].environment.OPENBAO_ADDR).toBe("http://openbao:8200");
+  });
+
+  it("does not inject II_SECRET_SEEDS into app service", () => {
+    const doc = parse(compileToCompose(secretApp));
+    expect(doc.services.web.environment.II_SECRET_SEEDS).toBeUndefined();
   });
 
   it("does not add valkey when only secrets present", () => {
@@ -230,10 +242,10 @@ describe("compileToCompose with mixed resources", () => {
     expect(doc.services.web.environment.OPENBAO_ADDR).toBe("http://openbao:8200");
   });
 
-  it("depends on both valkey and openbao", () => {
+  it("depends on both valkey and vault-init", () => {
     const doc = parse(compileToCompose(mixedApp));
     expect(doc.services.web.depends_on).toContain("valkey");
-    expect(doc.services.web.depends_on).toContain("openbao");
+    expect(doc.services.web.depends_on).toContain("vault-init");
   });
 });
 
@@ -817,20 +829,21 @@ describe("compileToCompose with capability imports", () => {
     expect(secrets).toEqual(["DATABASE_URL", "REDIS_URL"]);
   });
 
-  it("injects II_SECRET_SEEDS with connection strings", () => {
+  it("puts II_SECRET_SEEDS on vault-init, not app service", () => {
     const doc = parse(compileToCompose(capabilityApp));
-    const seeds = JSON.parse(doc.services.web.environment.II_SECRET_SEEDS);
+    expect(doc.services.web.environment.II_SECRET_SEEDS).toBeUndefined();
+    const seeds = JSON.parse(doc.services["vault-init"].environment.II_SECRET_SEEDS);
     expect(seeds).toEqual({
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/app",
       REDIS_URL: "redis://valkey:6379",
     });
   });
 
-  it("depends on postgres, valkey, and openbao", () => {
+  it("depends on postgres, valkey, and vault-init", () => {
     const doc = parse(compileToCompose(capabilityApp));
     expect(doc.services.web.depends_on).toContain("postgres");
     expect(doc.services.web.depends_on).toContain("valkey");
-    expect(doc.services.web.depends_on).toContain("openbao");
+    expect(doc.services.web.depends_on).toContain("vault-init");
   });
 
   it("creates volumes for postgres and valkey", () => {
@@ -874,9 +887,10 @@ describe("compileToCompose with capability imports + other secrets", () => {
     expect(secrets).toEqual(["DATABASE_URL", "STRIPE_API_KEY"]);
   });
 
-  it("II_SECRET_SEEDS only includes engine-managed secrets", () => {
+  it("II_SECRET_SEEDS only on vault-init, only includes engine-managed secrets", () => {
     const doc = parse(compileToCompose(capabilityWithOtherSecretsApp));
-    const seeds = JSON.parse(doc.services.web.environment.II_SECRET_SEEDS);
+    expect(doc.services.web.environment.II_SECRET_SEEDS).toBeUndefined();
+    const seeds = JSON.parse(doc.services["vault-init"].environment.II_SECRET_SEEDS);
     expect(seeds).toEqual({
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/app",
     });
@@ -913,7 +927,7 @@ describe("compileToK8s with capability imports", () => {
     expect(valkeyDeploy).toBeDefined();
   });
 
-  it("injects II_SECRET_SEEDS into app containers", () => {
+  it("puts II_SECRET_SEEDS on init container, not app container", () => {
     const docs = compileToK8s(capabilityApp)
       .split("---\n")
       .map((d) => parse(d));
@@ -921,8 +935,16 @@ describe("compileToK8s with capability imports", () => {
     const webDeploy = docs.find(
       (d) => d.kind === "Deployment" && d.metadata.name === "web"
     );
-    const env = webDeploy.spec.template.spec.containers[0].env;
-    const seedsEntry = env.find((e: { name: string }) => e.name === "II_SECRET_SEEDS");
+    const appEnv = webDeploy.spec.template.spec.containers[0].env;
+    const appSeedsEntry = appEnv.find((e: { name: string }) => e.name === "II_SECRET_SEEDS");
+    expect(appSeedsEntry).toBeUndefined();
+
+    const initContainers = webDeploy.spec.template.spec.initContainers;
+    expect(initContainers).toBeDefined();
+    expect(initContainers).toHaveLength(1);
+    expect(initContainers[0].name).toBe("vault-init");
+    const initEnv = initContainers[0].env;
+    const seedsEntry = initEnv.find((e: { name: string }) => e.name === "II_SECRET_SEEDS");
     expect(seedsEntry).toBeDefined();
     const seeds = JSON.parse(seedsEntry.value);
     expect(seeds).toEqual({
