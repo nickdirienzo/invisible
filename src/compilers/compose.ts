@@ -1,5 +1,60 @@
 import { stringify } from "yaml";
-import type { App, Resource, EventEmitterResource, Service } from "../ir/index.js";
+import type { App, Resource, EventEmitterResource, CapabilityImportResource, Service } from "../ir/index.js";
+
+// ---------------------------------------------------------------------------
+// Engine provisioning config for capability-import resources
+// ---------------------------------------------------------------------------
+
+interface EngineConfig {
+  service: string;
+  image: string;
+  port: number;
+  connectionUrl: string;
+  serviceEnv?: Record<string, string>;
+  command?: string[];
+  volume: { name: string; mount: string };
+}
+
+const ENGINE_COMPOSE: Record<string, EngineConfig> = {
+  postgres: {
+    service: "postgres",
+    image: "postgres:17-alpine",
+    port: 5432,
+    connectionUrl: "postgres://postgres:postgres@postgres:5432/app",
+    serviceEnv: { POSTGRES_USER: "postgres", POSTGRES_PASSWORD: "postgres", POSTGRES_DB: "app" },
+    volume: { name: "postgres-data", mount: "/var/lib/postgresql/data" },
+  },
+  mysql: {
+    service: "mysql",
+    image: "mysql:8",
+    port: 3306,
+    connectionUrl: "mysql://root:root@mysql:3306/app",
+    serviceEnv: { MYSQL_ROOT_PASSWORD: "root", MYSQL_DATABASE: "app" },
+    volume: { name: "mysql-data", mount: "/var/lib/mysql" },
+  },
+  mongodb: {
+    service: "mongodb",
+    image: "mongo:7",
+    port: 27017,
+    connectionUrl: "mongodb://mongodb:27017/app",
+    volume: { name: "mongodb-data", mount: "/data/db" },
+  },
+  valkey: {
+    service: "valkey",
+    image: "valkey/valkey:8-alpine",
+    port: 6379,
+    connectionUrl: "redis://valkey:6379",
+    command: ["valkey-server", "--appendonly", "yes"],
+    volume: { name: "valkey-data", mount: "/data" },
+  },
+};
+
+const ENGINE_SECRET_NAME: Record<string, string> = {
+  postgres: "DATABASE_URL",
+  mysql: "DATABASE_URL",
+  mongodb: "MONGODB_URL",
+  valkey: "REDIS_URL",
+};
 
 interface ComposeBuild {
   context: string;
@@ -68,6 +123,42 @@ function getCronJobsManifest(resources: Resource[]): Array<{ name: string; endpo
     .map((r) => r.kind === "cron-job" ? { name: r.name, endpoint: r.endpoint, method: r.method } : { name: "", endpoint: "", method: "" });
 }
 
+/** Collect unique provisioned engines from capability-import resources. */
+function getProvisionedEngines(resources: Resource[]): EngineConfig[] {
+  const seen = new Set<string>();
+  const engines: EngineConfig[] = [];
+  for (const r of resources) {
+    if (r.kind !== "capability-import") continue;
+    const cap = r as CapabilityImportResource;
+    if (cap.provisioning !== "replace" || !cap.engine) continue;
+    const cfg = ENGINE_COMPOSE[cap.engine];
+    if (cfg && !seen.has(cap.engine)) {
+      seen.add(cap.engine);
+      engines.push(cfg);
+    }
+  }
+  return engines;
+}
+
+/** Build II_SECRET_SEEDS: maps secret names to connection strings for provisioned engines. */
+function getSecretSeeds(resources: Resource[]): Record<string, string> {
+  const seeds: Record<string, string> = {};
+  const seen = new Set<string>();
+  for (const r of resources) {
+    if (r.kind !== "capability-import") continue;
+    const cap = r as CapabilityImportResource;
+    if (cap.provisioning !== "replace" || !cap.engine) continue;
+    if (seen.has(cap.engine)) continue;
+    seen.add(cap.engine);
+    const secretName = ENGINE_SECRET_NAME[cap.engine];
+    const cfg = ENGINE_COMPOSE[cap.engine];
+    if (secretName && cfg) {
+      seeds[secretName] = cfg.connectionUrl;
+    }
+  }
+  return seeds;
+}
+
 export function compileToCompose(app: App): string {
   const compose: ComposeFile = { services: {} };
   const isMultiService = app.services.length > 1;
@@ -78,6 +169,9 @@ export function compileToCompose(app: App): string {
   const appHasCron = hasCronJobs(app);
   const appHasEvents = hasEventEmitters(app);
   const appHasDapr = appHasCron || appHasEvents;
+  const appEngines = getProvisionedEngines(app.resources ?? []);
+  const appNeedsValkey = appHasMaps || appHasEvents || appHasCron || appEngines.some((e) => e.service === "valkey");
+  const appSecretSeeds = getSecretSeeds(app.resources ?? []);
 
   for (const svc of app.services) {
     // Per-service resource scoping
@@ -87,6 +181,8 @@ export function compileToCompose(app: App): string {
     const svcHasCron = svcResources.some((r) => r.kind === "cron-job");
     const svcHasEvents = svcResources.some((r) => r.kind === "event-emitter");
     const svcHasDapr = svcHasCron || svcHasEvents;
+    const svcEngines = getProvisionedEngines(svcResources);
+    const svcSecretSeeds = getSecretSeeds(svcResources);
 
     const dockerfileName = isMultiService
       ? `.ii/Dockerfile.${svc.name}`
@@ -120,6 +216,9 @@ export function compileToCompose(app: App): string {
       env.OPENBAO_ADDR = "http://openbao:8200";
       env.OPENBAO_TOKEN = "dev-root-token";
       env.OPENBAO_SECRETS = JSON.stringify(getSecretNames(svcResources));
+      if (Object.keys(svcSecretSeeds).length > 0) {
+        env.II_SECRET_SEEDS = JSON.stringify(svcSecretSeeds);
+      }
     }
     if (svcHasDapr) {
       env.II_APP_PORT = String(svc.port);
@@ -139,6 +238,9 @@ export function compileToCompose(app: App): string {
     // reconciliation) is backed by Valkey instead of SQLite.
     if (svcHasMaps || svcHasEvents || svcHasCron) deps.push("valkey");
     if (svcHasSecrets) deps.push("openbao");
+    for (const eng of svcEngines) {
+      if (!deps.includes(eng.service)) deps.push(eng.service);
+    }
     if (deps.length > 0) {
       composeSvc.depends_on = deps;
     }
@@ -168,15 +270,28 @@ export function compileToCompose(app: App): string {
     }
   }
 
-  // Valkey is needed for durable maps, events (pub/sub), and cron jobs
-  // (Dapr state store for job reconciliation).
-  if (appHasMaps || appHasEvents || appHasCron) {
+  // Valkey is needed for durable maps, events (pub/sub), cron jobs
+  // (Dapr state store for job reconciliation), and kv capability imports.
+  if (appNeedsValkey) {
     compose.services.valkey = {
       image: "valkey/valkey:8-alpine",
       command: ["valkey-server", "--appendonly", "yes"],
       ports: ["6379:6379"],
       volumes: ["valkey-data:/data"],
     };
+  }
+
+  // Database engines provisioned from capability-import resources.
+  for (const eng of appEngines) {
+    if (eng.service === "valkey") continue; // handled above
+    const dbSvc: ComposeService = {
+      image: eng.image,
+      ports: [`${eng.port}:${eng.port}`],
+    };
+    if (eng.serviceEnv) dbSvc.environment = eng.serviceEnv;
+    if (eng.command) dbSvc.command = eng.command;
+    dbSvc.volumes = [`${eng.volume.name}:${eng.volume.mount}`];
+    compose.services[eng.service] = dbSvc;
   }
 
   if (appHasSecrets) {
@@ -202,7 +317,11 @@ export function compileToCompose(app: App): string {
   }
 
   const volumes: Record<string, Record<string, never>> = {};
-  if (appHasMaps || appHasEvents || appHasCron) volumes["valkey-data"] = {};
+  if (appNeedsValkey) volumes["valkey-data"] = {};
+  for (const eng of appEngines) {
+    if (eng.service === "valkey") continue; // handled above
+    volumes[eng.volume.name] = {};
+  }
   if (Object.keys(volumes).length > 0) {
     compose.volumes = volumes;
   }
