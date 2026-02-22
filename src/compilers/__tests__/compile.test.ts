@@ -751,3 +751,183 @@ describe("compileToCompose with cron + events", () => {
     expect(doc.services.web.environment.VALKEY_URL).toBe("valkey://valkey:6379");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Capability-import resources (database provisioning)
+// ---------------------------------------------------------------------------
+
+const capabilityApp: App = {
+  name: "capability-app",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "index.ts",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+    },
+  ],
+  resources: [
+    {
+      kind: "capability-import",
+      module: "pg",
+      capability: "relational",
+      engine: "postgres",
+      provisioning: "replace",
+      sourceFile: "index.ts",
+      name: "postgres",
+    },
+    {
+      kind: "capability-import",
+      module: "redis",
+      capability: "kv",
+      engine: "valkey",
+      provisioning: "replace",
+      sourceFile: "index.ts",
+      name: "valkey",
+    },
+    { kind: "secret", name: "DATABASE_URL", sourceFile: "index.ts" },
+    { kind: "secret", name: "REDIS_URL", sourceFile: "index.ts" },
+  ],
+};
+
+describe("compileToCompose with capability imports", () => {
+  it("adds postgres service", () => {
+    const doc = parse(compileToCompose(capabilityApp));
+    expect(doc.services.postgres).toBeDefined();
+    expect(doc.services.postgres.image).toBe("postgres:17-alpine");
+    expect(doc.services.postgres.ports).toEqual(["5432:5432"]);
+    expect(doc.services.postgres.environment).toEqual({
+      POSTGRES_USER: "postgres",
+      POSTGRES_PASSWORD: "postgres",
+      POSTGRES_DB: "app",
+    });
+  });
+
+  it("adds valkey service for kv capability", () => {
+    const doc = parse(compileToCompose(capabilityApp));
+    expect(doc.services.valkey).toBeDefined();
+    expect(doc.services.valkey.image).toBe("valkey/valkey:8-alpine");
+  });
+
+  it("injects OPENBAO_SECRETS with DATABASE_URL and REDIS_URL", () => {
+    const doc = parse(compileToCompose(capabilityApp));
+    const secrets = JSON.parse(doc.services.web.environment.OPENBAO_SECRETS);
+    expect(secrets).toEqual(["DATABASE_URL", "REDIS_URL"]);
+  });
+
+  it("injects II_SECRET_SEEDS with connection strings", () => {
+    const doc = parse(compileToCompose(capabilityApp));
+    const seeds = JSON.parse(doc.services.web.environment.II_SECRET_SEEDS);
+    expect(seeds).toEqual({
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/app",
+      REDIS_URL: "redis://valkey:6379",
+    });
+  });
+
+  it("depends on postgres, valkey, and openbao", () => {
+    const doc = parse(compileToCompose(capabilityApp));
+    expect(doc.services.web.depends_on).toContain("postgres");
+    expect(doc.services.web.depends_on).toContain("valkey");
+    expect(doc.services.web.depends_on).toContain("openbao");
+  });
+
+  it("creates volumes for postgres and valkey", () => {
+    const doc = parse(compileToCompose(capabilityApp));
+    expect(doc.volumes["postgres-data"]).toBeDefined();
+    expect(doc.volumes["valkey-data"]).toBeDefined();
+  });
+});
+
+const capabilityWithOtherSecretsApp: App = {
+  name: "mixed-cap-app",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "index.ts",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+    },
+  ],
+  resources: [
+    {
+      kind: "capability-import",
+      module: "pg",
+      capability: "relational",
+      engine: "postgres",
+      provisioning: "replace",
+      sourceFile: "index.ts",
+      name: "postgres",
+    },
+    { kind: "secret", name: "DATABASE_URL", sourceFile: "index.ts" },
+    { kind: "secret", name: "STRIPE_API_KEY", sourceFile: "index.ts" },
+  ],
+};
+
+describe("compileToCompose with capability imports + other secrets", () => {
+  it("OPENBAO_SECRETS includes all secrets", () => {
+    const doc = parse(compileToCompose(capabilityWithOtherSecretsApp));
+    const secrets = JSON.parse(doc.services.web.environment.OPENBAO_SECRETS);
+    expect(secrets).toEqual(["DATABASE_URL", "STRIPE_API_KEY"]);
+  });
+
+  it("II_SECRET_SEEDS only includes engine-managed secrets", () => {
+    const doc = parse(compileToCompose(capabilityWithOtherSecretsApp));
+    const seeds = JSON.parse(doc.services.web.environment.II_SECRET_SEEDS);
+    expect(seeds).toEqual({
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/app",
+    });
+  });
+});
+
+describe("compileToK8s with capability imports", () => {
+  it("adds postgres Deployment and Service", () => {
+    const docs = compileToK8s(capabilityApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const pgDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "postgres"
+    );
+    expect(pgDeploy).toBeDefined();
+    expect(pgDeploy.spec.template.spec.containers[0].image).toBe("postgres:17-alpine");
+
+    const pgSvc = docs.find(
+      (d) => d.kind === "Service" && d.metadata.name === "postgres"
+    );
+    expect(pgSvc).toBeDefined();
+    expect(pgSvc.spec.ports[0].port).toBe(5432);
+  });
+
+  it("adds Valkey Deployment and Service for kv capability", () => {
+    const docs = compileToK8s(capabilityApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const valkeyDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "valkey"
+    );
+    expect(valkeyDeploy).toBeDefined();
+  });
+
+  it("injects II_SECRET_SEEDS into app containers", () => {
+    const docs = compileToK8s(capabilityApp)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const webDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "web"
+    );
+    const env = webDeploy.spec.template.spec.containers[0].env;
+    const seedsEntry = env.find((e: { name: string }) => e.name === "II_SECRET_SEEDS");
+    expect(seedsEntry).toBeDefined();
+    const seeds = JSON.parse(seedsEntry.value);
+    expect(seeds).toEqual({
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/app",
+      REDIS_URL: "redis://valkey:6379",
+    });
+  });
+});
