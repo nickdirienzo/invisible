@@ -81,8 +81,17 @@ function hasDurableMaps(app: App): boolean {
   return app.resources?.some((r) => r.kind === "durable-map") ?? false;
 }
 
+function getPreserveEnvVars(app: App): Set<string> {
+  const vars = new Set<string>();
+  for (const pv of getPreserveVolumes(app)) {
+    vars.add(pv.envVar);
+  }
+  return vars;
+}
+
 function hasSecrets(app: App): boolean {
-  return app.resources?.some((r) => r.kind === "secret") ?? false;
+  const preserveVars = getPreserveEnvVars(app);
+  return (app.resources ?? []).some((r) => r.kind === "secret" && !preserveVars.has(r.name));
 }
 
 function hasCronJobs(app: App): boolean {
@@ -94,9 +103,10 @@ function hasEventEmitters(app: App): boolean {
 }
 
 function getSecretNames(app: App): string[] {
+  const preserveVars = getPreserveEnvVars(app);
   return [...new Set(
     (app.resources ?? [])
-      .filter((r) => r.kind === "secret")
+      .filter((r) => r.kind === "secret" && !preserveVars.has(r.name))
       .map((r) => r.name)
   )];
 }
@@ -166,11 +176,7 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
 
   const initContainers: Record<string, unknown>[] = [];
   if (hasSecretResources) {
-    const preserveSeeds: Record<string, string> = {};
-    for (const pv of getPreserveVolumes(app)) {
-      preserveSeeds[pv.envVar] = `${pv.mountPath}/${pv.dbFile}`;
-    }
-    const seeds = { ...getSecretSeeds(app), ...preserveSeeds, ...envSeeds };
+    const seeds = { ...getSecretSeeds(app), ...envSeeds };
     const initEnv = [
       { name: "OPENBAO_ADDR", value: "http://openbao:8200" },
       { name: "OPENBAO_TOKEN", value: "dev-root-token" },
