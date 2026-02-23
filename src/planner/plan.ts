@@ -159,9 +159,23 @@ function readPackageJson(dir: string): PackageJson {
 }
 
 function findSourceFiles(dir: string): string[] {
-  return readdirSync(dir, { withFileTypes: true })
-    .filter((e) => !e.isDirectory() && /\.(ts|js|mjs|mts)$/.test(e.name))
-    .map((e) => e.name);
+  const results: string[] = [];
+
+  function walk(currentDir: string, prefix: string) {
+    const entries = readdirSync(currentDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "dist" || entry.name === ".ii") continue;
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        walk(join(currentDir, entry.name), rel);
+      } else if (/\.(ts|js|mjs|mts|tsx|jsx)$/.test(entry.name)) {
+        results.push(rel);
+      }
+    }
+  }
+
+  walk(dir, "");
+  return results;
 }
 
 function createProgram(projectDir: string, files: string[]) {
