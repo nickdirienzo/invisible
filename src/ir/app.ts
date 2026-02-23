@@ -19,6 +19,8 @@ export interface Service {
   buildCmd?: string;
   /** When true, the service is a static site served by nginx (no server process) */
   static?: boolean;
+  /** TypeScript rootDir from tsconfig — used to compute correct dist/ path */
+  rootDir?: string;
 }
 
 export interface IngressRule {

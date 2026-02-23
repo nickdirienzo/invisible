@@ -150,6 +150,37 @@ describe("detectListenCall", () => {
     expect(secrets![0].name).toBe("DATABASE_PATH");
     expect(secrets![0].sourceFile).toBe("src/db.ts");
   });
+
+  it("detects rootDir from tsconfig.json", () => {
+    const dir = makeProject({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: { rootDir: "src", outDir: "dist" },
+        include: ["src"],
+      }),
+      "src/server.ts": `
+        import express from "express";
+        const app = express();
+        app.listen(3000);
+      `,
+    });
+    const result = plan(dir);
+    expect(result.services[0].rootDir).toBe("src");
+  });
+
+  it("omits rootDir when tsconfig has no rootDir", () => {
+    const dir = makeProject({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: { outDir: "dist" },
+      }),
+      "server.ts": `
+        import express from "express";
+        const app = express();
+        app.listen(3000);
+      `,
+    });
+    const result = plan(dir);
+    expect(result.services[0].rootDir).toBeUndefined();
+  });
 });
 
 describe("detectFrameworkStart", () => {

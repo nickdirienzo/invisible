@@ -529,6 +529,34 @@ describe("compileToK8s with cron jobs", () => {
   });
 });
 
+describe("compileToDockerfile with rootDir", () => {
+  it("strips rootDir prefix from entrypoint in CMD", () => {
+    const svc = {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "src/server.ts",
+      typescript: true,
+      rootDir: "src",
+    };
+    const dockerfile = compileToDockerfile(svc, "node dist/server.js");
+    expect(dockerfile).toContain('CMD ["node", "dist/server.js"]');
+    expect(dockerfile).not.toContain("dist/src/server.js");
+  });
+
+  it("leaves entrypoint alone when no rootDir", () => {
+    const svc = {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "src/server.ts",
+      typescript: true,
+    };
+    const dockerfile = compileToDockerfile(svc, "node dist/src/server.js");
+    expect(dockerfile).toContain('CMD ["node", "dist/src/server.js"]');
+  });
+});
+
 describe("compileToDockerfile with cron jobs", () => {
   it("includes --import for II server", () => {
     const dockerfile = compileToDockerfile(cronApp.services[0], "node index.js", {

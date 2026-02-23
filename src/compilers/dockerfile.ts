@@ -59,7 +59,11 @@ CMD ["npm", "run", "start"]
   }
 
   if (svc.typescript) {
-    const jsEntry = svc.entrypoint.replace(/\.ts$/, ".js").replace(/\.mts$/, ".mjs");
+    let entryForDist = svc.entrypoint;
+    if (svc.rootDir && entryForDist.startsWith(svc.rootDir + "/")) {
+      entryForDist = entryForDist.slice(svc.rootDir.length + 1);
+    }
+    const jsEntry = entryForDist.replace(/\.ts$/, ".js").replace(/\.mts$/, ".mjs");
     const needsCustomBuild = hasResources || hasCronJobs || hasEvents;
     const buildCopyParts: string[] = [];
     if (needsCustomBuild) {
