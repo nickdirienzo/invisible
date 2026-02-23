@@ -14,6 +14,22 @@ interface EngineK8sConfig {
   env?: Array<{ name: string; value: string }>;
 }
 
+interface PreserveVolumeK8sConfig {
+  volumeName: string;
+  mountPath: string;
+  dbFile: string;
+  envVar: string;
+}
+
+const PRESERVE_ENGINE_K8S: Record<string, PreserveVolumeK8sConfig> = {
+  sqlite: {
+    volumeName: "sqlite-data",
+    mountPath: "/data",
+    dbFile: "app.db",
+    envVar: "DATABASE_PATH",
+  },
+};
+
 const ENGINE_K8S: Record<string, EngineK8sConfig> = {
   postgres: {
     name: "postgres",
@@ -91,13 +107,29 @@ function getEventsManifest(app: App): Array<{ namespace: string; events: string[
     .map((r) => ({ namespace: r.name, events: r.events }));
 }
 
+function getPreserveVolumes(app: App): PreserveVolumeK8sConfig[] {
+  const seen = new Set<string>();
+  const configs: PreserveVolumeK8sConfig[] = [];
+  for (const r of (app.resources ?? [])) {
+    if (r.kind !== "capability-import") continue;
+    const cap = r as CapabilityImportResource;
+    if (cap.provisioning !== "preserve" || !cap.engine) continue;
+    const cfg = PRESERVE_ENGINE_K8S[cap.engine];
+    if (cfg && !seen.has(cap.engine)) {
+      seen.add(cap.engine);
+      configs.push(cfg);
+    }
+  }
+  return configs;
+}
+
 function getCronJobsManifest(app: App): Array<{ name: string; endpoint: string; method: string }> {
   return (app.resources ?? [])
     .filter((r) => r.kind === "cron-job")
     .map((r) => r.kind === "cron-job" ? { name: r.name, endpoint: r.endpoint, method: r.method } : { name: "", endpoint: "", method: "" });
 }
 
-function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResources: boolean, hasDapr: boolean, hasCron: boolean, hasEvents: boolean): K8sManifest {
+function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResources: boolean, hasDapr: boolean, hasCron: boolean, hasEvents: boolean, envSeeds?: Record<string, string>): K8sManifest {
   const labels = { app: svc.name };
   const replicas = svc.scale?.min ?? 1;
 
@@ -123,8 +155,6 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
     envEntries.push({ name: "II_CRON_JOBS", value: JSON.stringify(getCronJobsManifest(app)) });
   }
 
-  const env = envEntries.length > 0 ? envEntries : undefined;
-
   const templateMetadata: Record<string, unknown> = { labels };
   if (hasDapr) {
     templateMetadata.annotations = {
@@ -136,7 +166,11 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
 
   const initContainers: Record<string, unknown>[] = [];
   if (hasSecretResources) {
-    const seeds = getSecretSeeds(app);
+    const preserveSeeds: Record<string, string> = {};
+    for (const pv of getPreserveVolumes(app)) {
+      preserveSeeds[pv.envVar] = `${pv.mountPath}/${pv.dbFile}`;
+    }
+    const seeds = { ...getSecretSeeds(app), ...preserveSeeds, ...envSeeds };
     const initEnv = [
       { name: "OPENBAO_ADDR", value: "http://openbao:8200" },
       { name: "OPENBAO_TOKEN", value: "dev-root-token" },
@@ -153,6 +187,36 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
     });
   }
 
+  const preserveVols = getPreserveVolumes(app);
+  for (const pv of preserveVols) {
+    envEntries.push({ name: pv.envVar, value: `${pv.mountPath}/${pv.dbFile}` });
+  }
+  const finalEnv = envEntries.length > 0 ? envEntries : undefined;
+
+  const containerSpec: Record<string, unknown> = {
+    name: svc.name,
+    image: `${app.name}/${svc.name}`,
+    ports: [{ containerPort: svc.port }],
+    ...(finalEnv ? { env: finalEnv } : {}),
+  };
+  if (preserveVols.length > 0) {
+    containerSpec.volumeMounts = preserveVols.map((pv) => ({
+      name: pv.volumeName,
+      mountPath: pv.mountPath,
+    }));
+  }
+
+  const podSpec: Record<string, unknown> = {
+    ...(initContainers.length > 0 ? { initContainers } : {}),
+    containers: [containerSpec],
+  };
+  if (preserveVols.length > 0) {
+    podSpec.volumes = preserveVols.map((pv) => ({
+      name: pv.volumeName,
+      persistentVolumeClaim: { claimName: pv.volumeName },
+    }));
+  }
+
   return {
     apiVersion: "apps/v1",
     kind: "Deployment",
@@ -162,17 +226,7 @@ function makeDeployment(app: App, svc: Service, hasMaps: boolean, hasSecretResou
       selector: { matchLabels: labels },
       template: {
         metadata: templateMetadata,
-        spec: {
-          ...(initContainers.length > 0 ? { initContainers } : {}),
-          containers: [
-            {
-              name: svc.name,
-              image: `${app.name}/${svc.name}`,
-              ports: [{ containerPort: svc.port }],
-              ...(env ? { env } : {}),
-            },
-          ],
-        },
+        spec: podSpec,
       },
     },
   };
@@ -390,7 +444,7 @@ function makeDaprPubsubComponent(): K8sManifest {
   };
 }
 
-export function compileToK8s(app: App): string {
+export function compileToK8s(app: App, envSeeds?: Record<string, string>): string {
   const manifests: K8sManifest[] = [];
   const hasMaps = hasDurableMaps(app);
   const hasSecretResources = hasSecrets(app);
@@ -401,7 +455,7 @@ export function compileToK8s(app: App): string {
   const needsValkey = hasMaps || hasEvents || hasCron || engines.some((e) => e.name === "valkey");
 
   for (const svc of app.services) {
-    manifests.push(makeDeployment(app, svc, hasMaps, hasSecretResources, hasDapr, hasCron, hasEvents));
+    manifests.push(makeDeployment(app, svc, hasMaps, hasSecretResources, hasDapr, hasCron, hasEvents, envSeeds));
     manifests.push(makeService(svc));
 
     if (svc.ingress?.length) {
@@ -432,6 +486,18 @@ export function compileToK8s(app: App): string {
 
   if (hasEvents) {
     manifests.push(makeDaprPubsubComponent());
+  }
+
+  for (const pv of getPreserveVolumes(app)) {
+    manifests.push({
+      apiVersion: "v1",
+      kind: "PersistentVolumeClaim",
+      metadata: { name: pv.volumeName },
+      spec: {
+        accessModes: ["ReadWriteOnce"],
+        resources: { requests: { storage: "1Gi" } },
+      },
+    });
   }
 
   return manifests.map((m) => stringify(m)).join("---\n");

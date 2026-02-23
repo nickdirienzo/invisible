@@ -12,6 +12,36 @@ const II_DIR = ".ii";
 const PLAN_FILE = "plan.json";
 const RESOURCES_FILE = "resources.json";
 
+function loadEnvFile(projectDir: string): Record<string, string> {
+  const candidates = [".env.local", ".env"];
+  for (const name of candidates) {
+    try {
+      const raw = readFileSync(join(projectDir, name), "utf-8");
+      return parseEnvFile(raw);
+    } catch {
+      // File not found — try next
+    }
+  }
+  return {};
+}
+
+function parseEnvFile(raw: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    let value = trimmed.slice(eqIdx + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    result[key] = value;
+  }
+  return result;
+}
+
 const USAGE = `Usage:
   ii plan             [project-dir]   Analyze source, write .ii/${PLAN_FILE}
   ii local up         [project-dir] [--no-cache]  Build and start locally via Docker Compose
@@ -289,6 +319,7 @@ async function doDeployLocal({ projectDir, planFile, noCache }: DeployOpts) {
   const app = loadOrPlan(projectDir, planFile);
   const out = iiDir(projectDir);
   const isMultiService = app.services.length > 1;
+  const envSeeds = loadEnvFile(projectDir);
 
   // App-level resource flags for shared infrastructure
   const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
@@ -322,7 +353,7 @@ async function doDeployLocal({ projectDir, planFile, noCache }: DeployOpts) {
   }
 
   writeFileSync(join(out, "Dockerfile.dockerignore"), "node_modules\n");
-  writeFileSync(join(out, "docker-compose.yml"), compileToCompose(app));
+  writeFileSync(join(out, "docker-compose.yml"), compileToCompose(app, envSeeds));
 
   if (hasMaps || hasCron || hasEvents) {
     writeResourceManifest(out, app);
@@ -516,6 +547,7 @@ async function reconcileCronJobs(
 function doDeployK8s({ projectDir, planFile }: DeployOpts) {
   const app = loadOrPlan(projectDir, planFile);
   const out = iiDir(projectDir);
+  const envSeeds = loadEnvFile(projectDir);
   const isMultiService = app.services.length > 1;
 
   const hasMaps = app.resources?.some((r) => r.kind === "durable-map") ?? false;
@@ -551,7 +583,7 @@ function doDeployK8s({ projectDir, planFile }: DeployOpts) {
   }
 
   writeFileSync(join(out, "Dockerfile.dockerignore"), "node_modules\n");
-  writeFileSync(join(out, "k8s.yml"), compileToK8s(app));
+  writeFileSync(join(out, "k8s.yml"), compileToK8s(app, envSeeds));
 
   if (hasMaps || hasCron || hasEvents) {
     writeResourceManifest(out, app);

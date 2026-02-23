@@ -229,6 +229,30 @@ describe("compileToCompose with secrets", () => {
   });
 });
 
+describe("compileToCompose with envSeeds", () => {
+  it("seeds user-provided secret values via II_SECRET_SEEDS", () => {
+    const envSeeds = { STRIPE_API_KEY: "sk_test_123", DATABASE_URL: "postgres://localhost/mydb" };
+    const doc = parse(compileToCompose(secretApp, envSeeds));
+    const seeds = JSON.parse(doc.services["vault-init"].environment.II_SECRET_SEEDS);
+    expect(seeds.STRIPE_API_KEY).toBe("sk_test_123");
+    expect(seeds.DATABASE_URL).toBe("postgres://localhost/mydb");
+  });
+
+  it("engine seeds are overridden by envSeeds", () => {
+    const envSeeds = { DATABASE_URL: "postgres://custom:5432/mydb" };
+    const doc = parse(compileToCompose(capabilityApp, envSeeds));
+    const seeds = JSON.parse(doc.services["vault-init"].environment.II_SECRET_SEEDS);
+    expect(seeds.DATABASE_URL).toBe("postgres://custom:5432/mydb");
+  });
+
+  it("produces II_SECRET_SEEDS even without engine seeds", () => {
+    const envSeeds = { STRIPE_API_KEY: "sk_live_abc" };
+    const doc = parse(compileToCompose(secretApp, envSeeds));
+    const seeds = JSON.parse(doc.services["vault-init"].environment.II_SECRET_SEEDS);
+    expect(seeds.STRIPE_API_KEY).toBe("sk_live_abc");
+  });
+});
+
 describe("compileToCompose with mixed resources", () => {
   it("adds both valkey and openbao services", () => {
     const doc = parse(compileToCompose(mixedApp));
@@ -979,5 +1003,135 @@ describe("compileToK8s with capability imports", () => {
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/app",
       REDIS_URL: "redis://valkey:6379",
     });
+  });
+});
+
+describe("compileToK8s with envSeeds", () => {
+  it("merges envSeeds into II_SECRET_SEEDS on init container", () => {
+    const envSeeds = { STRIPE_API_KEY: "sk_test_123" };
+    const docs = compileToK8s(secretApp, envSeeds)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const webDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "web"
+    );
+    const initContainers = webDeploy.spec.template.spec.initContainers;
+    const initEnv = initContainers[0].env;
+    const seedsEntry = initEnv.find((e: { name: string }) => e.name === "II_SECRET_SEEDS");
+    expect(seedsEntry).toBeDefined();
+    const seeds = JSON.parse(seedsEntry.value);
+    expect(seeds.STRIPE_API_KEY).toBe("sk_test_123");
+  });
+
+  it("envSeeds override engine-derived seeds", () => {
+    const envSeeds = { DATABASE_URL: "postgres://custom/db" };
+    const docs = compileToK8s(capabilityApp, envSeeds)
+      .split("---\n")
+      .map((d) => parse(d));
+
+    const webDeploy = docs.find(
+      (d) => d.kind === "Deployment" && d.metadata.name === "web"
+    );
+    const initContainers = webDeploy.spec.template.spec.initContainers;
+    const initEnv = initContainers[0].env;
+    const seedsEntry = initEnv.find((e: { name: string }) => e.name === "II_SECRET_SEEDS");
+    const seeds = JSON.parse(seedsEntry.value);
+    expect(seeds.DATABASE_URL).toBe("postgres://custom/db");
+  });
+});
+
+const sqliteApp: App = {
+  name: "sqlite-app",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "index.ts",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+    },
+  ],
+  resources: [
+    {
+      kind: "capability-import",
+      module: "node:sqlite",
+      capability: "relational-embedded",
+      engine: "sqlite",
+      provisioning: "preserve",
+      sourceFile: "index.ts",
+      name: "sqlite",
+    },
+    { kind: "secret", name: "DATABASE_PATH", sourceFile: "index.ts" },
+  ],
+};
+
+describe("compileToCompose with preserve engines (sqlite)", () => {
+  it("mounts a named volume on the app service", () => {
+    const doc = parse(compileToCompose(sqliteApp));
+    expect(doc.services.web.volumes).toContain("sqlite-data:/data");
+  });
+
+  it("sets DATABASE_PATH env var on the app service", () => {
+    const doc = parse(compileToCompose(sqliteApp));
+    expect(doc.services.web.environment.DATABASE_PATH).toBe("/data/app.db");
+  });
+
+  it("declares sqlite-data in top-level volumes", () => {
+    const doc = parse(compileToCompose(sqliteApp));
+    expect(doc.volumes["sqlite-data"]).toBeDefined();
+  });
+
+  it("seeds DATABASE_PATH into II_SECRET_SEEDS", () => {
+    const doc = parse(compileToCompose(sqliteApp));
+    const seeds = JSON.parse(doc.services["vault-init"].environment.II_SECRET_SEEDS);
+    expect(seeds.DATABASE_PATH).toBe("/data/app.db");
+  });
+
+  it("does not add a separate sqlite service", () => {
+    const doc = parse(compileToCompose(sqliteApp));
+    expect(doc.services.sqlite).toBeUndefined();
+  });
+});
+
+describe("compileToK8s with preserve engines (sqlite)", () => {
+  it("adds PersistentVolumeClaim for sqlite-data", () => {
+    const docs = compileToK8s(sqliteApp)
+      .split("---\n")
+      .map((d) => parse(d));
+    const pvc = docs.find((d) => d.kind === "PersistentVolumeClaim" && d.metadata.name === "sqlite-data");
+    expect(pvc).toBeDefined();
+    expect(pvc.spec.accessModes).toContain("ReadWriteOnce");
+  });
+
+  it("mounts volume on app container", () => {
+    const docs = compileToK8s(sqliteApp)
+      .split("---\n")
+      .map((d) => parse(d));
+    const deploy = docs.find((d) => d.kind === "Deployment" && d.metadata.name === "web");
+    const container = deploy.spec.template.spec.containers[0];
+    expect(container.volumeMounts).toEqual([{ name: "sqlite-data", mountPath: "/data" }]);
+  });
+
+  it("adds DATABASE_PATH env var to app container", () => {
+    const docs = compileToK8s(sqliteApp)
+      .split("---\n")
+      .map((d) => parse(d));
+    const deploy = docs.find((d) => d.kind === "Deployment" && d.metadata.name === "web");
+    const env = deploy.spec.template.spec.containers[0].env;
+    const dbPath = env.find((e: { name: string }) => e.name === "DATABASE_PATH");
+    expect(dbPath.value).toBe("/data/app.db");
+  });
+
+  it("seeds DATABASE_PATH into II_SECRET_SEEDS on init container", () => {
+    const docs = compileToK8s(sqliteApp)
+      .split("---\n")
+      .map((d) => parse(d));
+    const deploy = docs.find((d) => d.kind === "Deployment" && d.metadata.name === "web");
+    const initEnv = deploy.spec.template.spec.initContainers[0].env;
+    const seedsEntry = initEnv.find((e: { name: string }) => e.name === "II_SECRET_SEEDS");
+    const seeds = JSON.parse(seedsEntry.value);
+    expect(seeds.DATABASE_PATH).toBe("/data/app.db");
   });
 });
