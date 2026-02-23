@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { plan } from "../plan.js";
@@ -7,9 +8,10 @@ import { plan } from "../plan.js";
 function makeProject(files: Record<string, string>) {
   const dir = mkdtempSync(join(tmpdir(), "ii-test-"));
   for (const [name, content] of Object.entries(files)) {
-    writeFileSync(join(dir, name), content);
+    const filePath = join(dir, name);
+    mkdirSync(dirname(filePath), { recursive: true });
+    writeFileSync(filePath, content);
   }
-  // Every project needs a package.json
   if (!files["package.json"]) {
     writeFileSync(
       join(dir, "package.json"),
@@ -126,6 +128,27 @@ describe("detectListenCall", () => {
     });
     const result = plan(dir);
     expect(result.services[0].entrypoint).toBe("server.ts");
+  });
+
+  it("detects .listen() in subdirectories", () => {
+    const dir = makeProject({
+      "src/server.ts": `
+        import express from "express";
+        const app = express();
+        app.listen(3000);
+      `,
+      "src/db.ts": `
+        const dbPath = process.env.DATABASE_PATH || "app.db";
+      `,
+    });
+    const result = plan(dir);
+    expect(result.services[0].port).toBe(3000);
+    expect(result.services[0].ingress).toEqual([{ host: "", path: "/" }]);
+    expect(result.services[0].entrypoint).toBe("src/server.ts");
+    const secrets = result.resources?.filter((r) => r.kind === "secret");
+    expect(secrets).toHaveLength(1);
+    expect(secrets![0].name).toBe("DATABASE_PATH");
+    expect(secrets![0].sourceFile).toBe("src/db.ts");
   });
 });
 
