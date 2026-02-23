@@ -1083,10 +1083,11 @@ describe("compileToCompose with preserve engines (sqlite)", () => {
     expect(doc.volumes["sqlite-data"]).toBeDefined();
   });
 
-  it("seeds DATABASE_PATH into II_SECRET_SEEDS", () => {
+  it("does not treat DATABASE_PATH as a secret", () => {
     const doc = parse(compileToCompose(sqliteApp));
-    const seeds = JSON.parse(doc.services["vault-init"].environment.II_SECRET_SEEDS);
-    expect(seeds.DATABASE_PATH).toBe("/data/app.db");
+    expect(doc.services.openbao).toBeUndefined();
+    expect(doc.services["vault-init"]).toBeUndefined();
+    expect(doc.services.web.environment.OPENBAO_SECRETS).toBeUndefined();
   });
 
   it("does not add a separate sqlite service", () => {
@@ -1124,14 +1125,92 @@ describe("compileToK8s with preserve engines (sqlite)", () => {
     expect(dbPath.value).toBe("/data/app.db");
   });
 
-  it("seeds DATABASE_PATH into II_SECRET_SEEDS on init container", () => {
+  it("does not treat DATABASE_PATH as a secret", () => {
     const docs = compileToK8s(sqliteApp)
       .split("---\n")
       .map((d) => parse(d));
     const deploy = docs.find((d) => d.kind === "Deployment" && d.metadata.name === "web");
-    const initEnv = deploy.spec.template.spec.initContainers[0].env;
-    const seedsEntry = initEnv.find((e: { name: string }) => e.name === "II_SECRET_SEEDS");
-    const seeds = JSON.parse(seedsEntry.value);
-    expect(seeds.DATABASE_PATH).toBe("/data/app.db");
+    expect(deploy.spec.template.spec.initContainers).toBeUndefined();
+    const openbao = docs.find((d) => d.kind === "Deployment" && d.metadata.name === "openbao");
+    expect(openbao).toBeUndefined();
+  });
+});
+
+const sqliteWithSecretsApp: App = {
+  name: "sqlite-secrets-app",
+  services: [
+    {
+      name: "web",
+      build: "./",
+      port: 3000,
+      entrypoint: "index.ts",
+      typescript: true,
+      ingress: [{ host: "", path: "/" }],
+    },
+  ],
+  resources: [
+    {
+      kind: "capability-import",
+      module: "node:sqlite",
+      capability: "relational-embedded",
+      engine: "sqlite",
+      provisioning: "preserve",
+      sourceFile: "index.ts",
+      name: "sqlite",
+    },
+    { kind: "secret", name: "DATABASE_PATH", sourceFile: "index.ts" },
+    { kind: "secret", name: "ENCRYPTION_KEY", sourceFile: "index.ts" },
+  ],
+};
+
+describe("compileToCompose with sqlite + real secrets", () => {
+  it("excludes DATABASE_PATH from OPENBAO_SECRETS", () => {
+    const doc = parse(compileToCompose(sqliteWithSecretsApp));
+    const secrets = JSON.parse(doc.services.web.environment.OPENBAO_SECRETS);
+    expect(secrets).toEqual(["ENCRYPTION_KEY"]);
+    expect(secrets).not.toContain("DATABASE_PATH");
+  });
+
+  it("still sets DATABASE_PATH as a direct env var", () => {
+    const doc = parse(compileToCompose(sqliteWithSecretsApp));
+    expect(doc.services.web.environment.DATABASE_PATH).toBe("/data/app.db");
+  });
+
+  it("has openbao and vault-init for the real secret", () => {
+    const doc = parse(compileToCompose(sqliteWithSecretsApp));
+    expect(doc.services.openbao).toBeDefined();
+    expect(doc.services["vault-init"]).toBeDefined();
+  });
+
+  it("does not seed DATABASE_PATH into II_SECRET_SEEDS", () => {
+    const doc = parse(compileToCompose(sqliteWithSecretsApp));
+    const vaultInit = doc.services["vault-init"];
+    if (vaultInit.environment.II_SECRET_SEEDS) {
+      const seeds = JSON.parse(vaultInit.environment.II_SECRET_SEEDS);
+      expect(seeds.DATABASE_PATH).toBeUndefined();
+    }
+  });
+});
+
+describe("compileToK8s with sqlite + real secrets", () => {
+  it("excludes DATABASE_PATH from OPENBAO_SECRETS", () => {
+    const docs = compileToK8s(sqliteWithSecretsApp)
+      .split("---\n")
+      .map((d) => parse(d));
+    const deploy = docs.find((d) => d.kind === "Deployment" && d.metadata.name === "web");
+    const env = deploy.spec.template.spec.containers[0].env;
+    const secretsEntry = env.find((e: { name: string }) => e.name === "OPENBAO_SECRETS");
+    const secrets = JSON.parse(secretsEntry.value);
+    expect(secrets).toEqual(["ENCRYPTION_KEY"]);
+  });
+
+  it("still sets DATABASE_PATH as a direct env var", () => {
+    const docs = compileToK8s(sqliteWithSecretsApp)
+      .split("---\n")
+      .map((d) => parse(d));
+    const deploy = docs.find((d) => d.kind === "Deployment" && d.metadata.name === "web");
+    const env = deploy.spec.template.spec.containers[0].env;
+    const dbPath = env.find((e: { name: string }) => e.name === "DATABASE_PATH");
+    expect(dbPath.value).toBe("/data/app.db");
   });
 });

@@ -72,14 +72,6 @@ const PRESERVE_ENGINE_CONFIG: Record<string, PreserveVolumeConfig> = {
   },
 };
 
-function getPreserveSeeds(resources: Resource[]): Record<string, string> {
-  const seeds: Record<string, string> = {};
-  for (const pv of getPreserveVolumes(resources)) {
-    seeds[pv.envVar] = `${pv.mountPath}/${pv.dbFile}`;
-  }
-  return seeds;
-}
-
 function getPreserveVolumes(resources: Resource[]): PreserveVolumeConfig[] {
   const seen = new Set<string>();
   const configs: PreserveVolumeConfig[] = [];
@@ -131,10 +123,6 @@ function hasDurableMaps(app: App): boolean {
   return app.resources?.some((r) => r.kind === "durable-map") ?? false;
 }
 
-function hasSecrets(app: App): boolean {
-  return app.resources?.some((r) => r.kind === "secret") ?? false;
-}
-
 function hasCronJobs(app: App): boolean {
   return app.resources?.some((r) => r.kind === "cron-job") ?? false;
 }
@@ -143,10 +131,19 @@ function hasEventEmitters(app: App): boolean {
   return app.resources?.some((r) => r.kind === "event-emitter") ?? false;
 }
 
+function getPreserveEnvVars(resources: Resource[]): Set<string> {
+  const vars = new Set<string>();
+  for (const pv of getPreserveVolumes(resources)) {
+    vars.add(pv.envVar);
+  }
+  return vars;
+}
+
 function getSecretNames(resources: Resource[]): string[] {
+  const preserveVars = getPreserveEnvVars(resources);
   return [...new Set(
     resources
-      .filter((r) => r.kind === "secret")
+      .filter((r) => r.kind === "secret" && !preserveVars.has(r.name))
       .map((r) => r.name)
   )];
 }
@@ -205,20 +202,21 @@ export function compileToCompose(app: App, envSeeds?: Record<string, string>): s
 
   // App-level flags for shared infrastructure
   const appHasMaps = hasDurableMaps(app);
-  const appHasSecrets = hasSecrets(app);
+  const appPreserveVars = getPreserveEnvVars(app.resources ?? []);
+  const appHasSecrets = (app.resources ?? []).some((r) => r.kind === "secret" && !appPreserveVars.has(r.name));
   const appHasCron = hasCronJobs(app);
   const appHasEvents = hasEventEmitters(app);
   const appHasDapr = appHasCron || appHasEvents;
   const appEngines = getProvisionedEngines(app.resources ?? []);
   const appNeedsValkey = appHasMaps || appHasEvents || appHasCron || appEngines.some((e) => e.service === "valkey");
-  const appPreserveSeeds = getPreserveSeeds(app.resources ?? []);
-  const appSecretSeeds = { ...getSecretSeeds(app.resources ?? []), ...appPreserveSeeds, ...envSeeds };
+  const appSecretSeeds = { ...getSecretSeeds(app.resources ?? []), ...envSeeds };
 
   for (const svc of app.services) {
     // Per-service resource scoping
     const svcResources = serviceResources(app, svc, isMultiService);
     const svcHasMaps = svcResources.some((r) => r.kind === "durable-map");
-    const svcHasSecrets = svcResources.some((r) => r.kind === "secret");
+    const svcPreserveVars = getPreserveEnvVars(svcResources);
+    const svcHasSecrets = svcResources.some((r) => r.kind === "secret" && !svcPreserveVars.has(r.name));
     const svcHasCron = svcResources.some((r) => r.kind === "cron-job");
     const svcHasEvents = svcResources.some((r) => r.kind === "event-emitter");
     const svcHasDapr = svcHasCron || svcHasEvents;
