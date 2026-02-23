@@ -31,6 +31,7 @@ function planService(
   const hasIngress = listenResult !== null || frameworkResult !== null || staticResult !== null;
   const entrypoint = listenResult?.file ?? detectEntrypoint(sourceFiles);
   const typescript = entrypoint.endsWith(".ts") || entrypoint.endsWith(".tsx") || entrypoint.endsWith(".mts");
+  const rootDir = typescript ? detectRootDir(serviceDir) : undefined;
 
   const durableMaps = detectDurableMaps(program, serviceDir, sourceFiles);
   const secrets = detectSecrets(program, serviceDir, sourceFiles);
@@ -91,6 +92,7 @@ function planService(
       ...(frameworkResult?.startCmd ? { startCmd: frameworkResult.startCmd } : {}),
       ...(frameworkResult?.buildCmd ? { buildCmd: frameworkResult.buildCmd } : {}),
       ...(staticResult ? { buildCmd: staticResult.buildCmd, static: true } : {}),
+      ...(rootDir ? { rootDir } : {}),
     },
     resources,
   };
@@ -191,6 +193,20 @@ function createProgram(projectDir: string, files: string[]) {
   });
   const checker = program.getTypeChecker();
   return { program, checker };
+}
+
+function detectRootDir(serviceDir: string): string | undefined {
+  try {
+    const raw = readFileSync(join(serviceDir, "tsconfig.json"), "utf-8");
+    const parsed = JSON.parse(raw);
+    const rootDir = parsed?.compilerOptions?.rootDir;
+    if (typeof rootDir === "string" && rootDir !== "." && rootDir !== "./") {
+      return rootDir.replace(/^\.\//, "").replace(/\/$/, "");
+    }
+  } catch {
+    // No tsconfig or invalid — skip
+  }
+  return undefined;
 }
 
 function detectEntrypoint(files: string[]): string {
