@@ -56,6 +56,46 @@ const ENGINE_SECRET_NAME: Record<string, string> = {
   valkey: "REDIS_URL",
 };
 
+interface PreserveVolumeConfig {
+  volumeName: string;
+  mountPath: string;
+  dbFile: string;
+  envVar: string;
+}
+
+const PRESERVE_ENGINE_CONFIG: Record<string, PreserveVolumeConfig> = {
+  sqlite: {
+    volumeName: "sqlite-data",
+    mountPath: "/data",
+    dbFile: "app.db",
+    envVar: "DATABASE_PATH",
+  },
+};
+
+function getPreserveSeeds(resources: Resource[]): Record<string, string> {
+  const seeds: Record<string, string> = {};
+  for (const pv of getPreserveVolumes(resources)) {
+    seeds[pv.envVar] = `${pv.mountPath}/${pv.dbFile}`;
+  }
+  return seeds;
+}
+
+function getPreserveVolumes(resources: Resource[]): PreserveVolumeConfig[] {
+  const seen = new Set<string>();
+  const configs: PreserveVolumeConfig[] = [];
+  for (const r of resources) {
+    if (r.kind !== "capability-import") continue;
+    const cap = r as CapabilityImportResource;
+    if (cap.provisioning !== "preserve" || !cap.engine) continue;
+    const cfg = PRESERVE_ENGINE_CONFIG[cap.engine];
+    if (cfg && !seen.has(cap.engine)) {
+      seen.add(cap.engine);
+      configs.push(cfg);
+    }
+  }
+  return configs;
+}
+
 interface ComposeBuild {
   context: string;
   dockerfile: string;
@@ -159,7 +199,7 @@ function getSecretSeeds(resources: Resource[]): Record<string, string> {
   return seeds;
 }
 
-export function compileToCompose(app: App): string {
+export function compileToCompose(app: App, envSeeds?: Record<string, string>): string {
   const compose: ComposeFile = { services: {} };
   const isMultiService = app.services.length > 1;
 
@@ -171,7 +211,8 @@ export function compileToCompose(app: App): string {
   const appHasDapr = appHasCron || appHasEvents;
   const appEngines = getProvisionedEngines(app.resources ?? []);
   const appNeedsValkey = appHasMaps || appHasEvents || appHasCron || appEngines.some((e) => e.service === "valkey");
-  const appSecretSeeds = getSecretSeeds(app.resources ?? []);
+  const appPreserveSeeds = getPreserveSeeds(app.resources ?? []);
+  const appSecretSeeds = { ...getSecretSeeds(app.resources ?? []), ...appPreserveSeeds, ...envSeeds };
 
   for (const svc of app.services) {
     // Per-service resource scoping
@@ -183,6 +224,7 @@ export function compileToCompose(app: App): string {
     const svcHasDapr = svcHasCron || svcHasEvents;
     const svcEngines = getProvisionedEngines(svcResources);
     const svcSecretSeeds = getSecretSeeds(svcResources);
+    const svcPreserveVolumes = getPreserveVolumes(svcResources);
 
     const dockerfileName = isMultiService
       ? `.ii/Dockerfile.${svc.name}`
@@ -240,6 +282,15 @@ export function compileToCompose(app: App): string {
     }
     if (deps.length > 0) {
       composeSvc.depends_on = deps;
+    }
+
+    for (const pv of svcPreserveVolumes) {
+      composeSvc.volumes = composeSvc.volumes ?? [];
+      composeSvc.volumes.push(`${pv.volumeName}:${pv.mountPath}`);
+      env[pv.envVar] = `${pv.mountPath}/${pv.dbFile}`;
+    }
+    if (!composeSvc.environment && Object.keys(env).length > 0) {
+      composeSvc.environment = env;
     }
 
     compose.services[svc.name] = composeSvc;
@@ -330,11 +381,15 @@ export function compileToCompose(app: App): string {
     };
   }
 
+  const appPreserveVolumes = getPreserveVolumes(app.resources ?? []);
   const volumes: Record<string, Record<string, never>> = {};
   if (appNeedsValkey) volumes["valkey-data"] = {};
   for (const eng of appEngines) {
     if (eng.service === "valkey") continue; // handled above
     volumes[eng.volume.name] = {};
+  }
+  for (const pv of appPreserveVolumes) {
+    volumes[pv.volumeName] = {};
   }
   if (Object.keys(volumes).length > 0) {
     compose.volumes = volumes;
