@@ -4,6 +4,8 @@ Write normal Node.js code. Get deployable infrastructure for free.
 
 Invisible Infrastructure (II) reads your source code, figures out what backing services you need, and generates Docker Compose and Kubernetes artifacts automatically. No config files, no infrastructure-as-code — just your app.
 
+**This is a research experiment, not production software.** The ideas here are exploratory and everything is very far from stable.
+
 ## How it works
 
 II runs static analysis on your TypeScript/JS and detects patterns you're already writing:
