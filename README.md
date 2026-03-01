@@ -23,42 +23,36 @@ At build time, a TypeScript compiler transformer swaps stdlib primitives for the
 
 ## Quick example
 
-This is a complete, deployable app — no Dockerfile, no docker-compose.yml, no Valkey config:
+This is a complete, deployable app — no Dockerfile, no docker-compose.yml needed:
 
 ```typescript
 // index.ts
 import express from "express";
 
-const counters = new Map<string, number>();
-
 const app = express();
+const port = process.env.PORT || 3000;
 
-app.get("/:key", async (req, res) => {
-  const key = req.params.key;
-  const current = (await counters.get(key)) ?? 0;
-  await counters.set(key, current + 1);
-  res.json({ key, count: current + 1 });
+app.get("/", (req, res) => {
+  res.send("Hello World!");
 });
 
-app.listen(process.env.PORT || 3000);
+app.listen(port, () => {
+  console.log(`Listening on http://localhost:${port}`);
+});
 ```
 
 ```
 $ ii plan .
-durable-counter: 1 service(s)
+hello-world: 1 service(s)
   app
     port:    3000
     ingress: yes
-  durable maps:
-    counters (index.ts)
-  infrastructure:
-    valkey — durable map backend
 
 $ ii local up .
-# Builds Docker image, starts app + Valkey, wires everything together
+# Builds Docker image, starts app, wires everything together
 ```
 
-The `counters` Map survives restarts, scales across replicas, and works identically in local dev (where `await` on a sync Map is a no-op).
+See the `examples/` directory for more — durable state, secrets, cron jobs, events, and more.
 
 ## Usage
 
@@ -102,6 +96,16 @@ Source Code → Planner (AST analysis) → IR (JSON) → Compilers → Artifacts
 The planner uses the TypeScript compiler API to walk your AST and type-check what it finds (e.g. confirming `.listen()` is on an actual HTTP server, not some random object). The IR is a plain JSON description of services, ports, and resources. Compilers turn that into Dockerfiles, Compose files, or K8s manifests.
 
 More detail in `doc/how-it-works.md` and the ADRs in `doc/adr/`.
+
+## What can be automatic vs. what needs coordination
+
+Not everything the planner detects can be transparently swapped. The key distinction is between independent operations and operations that need coordination.
+
+**Automatic:** Single-key operations like `get`, `set`, `has`, `delete` are independent — each one maps directly to a Valkey command with no surrounding context needed. The planner can safely rewrite these without changing program behavior.
+
+**Needs coordination:** Read-then-write patterns like `get → modify → set` are a different story. Two concurrent requests can read the same value, both modify it, and one overwrites the other. Handling this correctly requires optimistic locking, atomic operations, or restructuring the code — decisions that a human or AI needs to make, not a compiler.
+
+The planner's job is to detect both categories and surface them. The first category gets rewritten automatically. The second category is flagged as a finding that needs a decision.
 
 ## What works well
 
