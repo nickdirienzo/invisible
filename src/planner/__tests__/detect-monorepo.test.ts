@@ -258,4 +258,40 @@ describe("monorepo detection", () => {
     expect(backend.build).toBe("./backend");
     expect(frontend.build).toBe("./frontend");
   });
+
+  it("includes root as service when it has a server alongside subdirectory services", () => {
+    const dir = makeMonorepo({
+      ".": {
+        "package.json": JSON.stringify({ name: "my-app" }),
+      },
+      src: {
+        "server.ts": `
+          import express from "express";
+          const app = express();
+          app.listen(3000);
+        `,
+      },
+      frontend: {
+        "package.json": JSON.stringify({
+          name: "frontend",
+          scripts: { build: "vite build" },
+        }),
+        "index.ts": "export {};",
+      },
+    });
+
+    const result = plan(dir);
+    expect(result.name).toBe("my-app");
+    expect(result.services).toHaveLength(2);
+    expect(result.services.map((s) => s.name).sort()).toEqual(["frontend", "web"]);
+
+    const web = result.services.find((s) => s.name === "web")!;
+    expect(web.port).toBe(3000);
+    expect(web.build).toBe("./");
+
+    const frontend = result.services.find((s) => s.name === "frontend")!;
+    expect(frontend.port).toBe(80);
+    expect(frontend.static).toBe(true);
+    expect(frontend.build).toBe("./frontend");
+  });
 });
