@@ -18,10 +18,11 @@ interface ServicePlan {
 function planService(
   serviceDir: string,
   serviceName: string,
-  buildPath: string
+  buildPath: string,
+  excludeDirs?: Set<string>
 ): ServicePlan {
   const pkg = readPackageJson(serviceDir);
-  const sourceFiles = findSourceFiles(serviceDir);
+  const sourceFiles = findSourceFiles(serviceDir, excludeDirs);
   const { program, checker } = createProgram(serviceDir, sourceFiles);
 
   const listenResult = detectListenCall(program, checker, serviceDir, sourceFiles);
@@ -130,6 +131,16 @@ export function plan(projectDir: string): App {
     const services: import("../ir/index.js").Service[] = [];
     const allResources: Resource[] = [];
 
+    // Check if root directory is also a service (has its own server/.listen())
+    const excludeNames = new Set(serviceDirs.map((s) => s.name));
+    const rootResult = planService(projectDir, "web", "./", excludeNames);
+    if (rootResult.service.ingress) {
+      services.push(rootResult.service);
+      for (const r of rootResult.resources) {
+        allResources.push(r);
+      }
+    }
+
     for (const svcDir of serviceDirs) {
       const result = planService(svcDir.dir, svcDir.name, `./${svcDir.name}`);
       services.push(result.service);
@@ -160,13 +171,14 @@ function readPackageJson(dir: string): PackageJson {
   return JSON.parse(raw) as PackageJson;
 }
 
-function findSourceFiles(dir: string): string[] {
+function findSourceFiles(dir: string, excludeDirs?: Set<string>): string[] {
   const results: string[] = [];
 
   function walk(currentDir: string, prefix: string) {
     const entries = readdirSync(currentDir, { withFileTypes: true });
     for (const entry of entries) {
       if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "dist" || entry.name === ".ii") continue;
+      if (excludeDirs && prefix === "" && entry.isDirectory() && excludeDirs.has(entry.name)) continue;
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
         walk(join(currentDir, entry.name), rel);
