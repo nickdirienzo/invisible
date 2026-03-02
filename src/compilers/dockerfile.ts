@@ -24,9 +24,8 @@ export function compileToDockerfile(
 
   // Build path prefix for monorepo services (e.g. "./api" → "api/")
   const buildDir = svc.build === "./" ? "" : svc.build.replace(/^\.\//, "") + "/";
-  // Monorepo: copy service package.json + root lockfile. Single-service: copy both from root.
   const copyPkg = buildDir
-    ? `COPY ${buildDir}package.json package-lock.json ./`
+    ? `COPY ${buildDir}package.json ${buildDir}package-lock.json ./`
     : "COPY package.json package-lock.json ./";
   const copySrc = buildDir ? `COPY ${buildDir} .` : "COPY . .";
 

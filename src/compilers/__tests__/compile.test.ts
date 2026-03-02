@@ -402,7 +402,7 @@ describe("compileToDockerfile with static site", () => {
   it("uses monorepo copy paths when build is a subdirectory", () => {
     const monoStaticSvc = { ...staticApp.services[0], build: "./web" };
     const dockerfile = compileToDockerfile(monoStaticSvc, "");
-    expect(dockerfile).toContain("COPY web/package.json package-lock.json ./");
+    expect(dockerfile).toContain("COPY web/package.json web/package-lock.json ./");
     expect(dockerfile).toContain("COPY web/ .");
   });
 });
