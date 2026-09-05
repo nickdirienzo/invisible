@@ -94,4 +94,6 @@ The command intentionally exits 1 with
 ## History
 
 The original language- and deployment-target exploration is preserved on the
-`v1-research-poc` branch and at the `v1-research-final` tag.
+`v1-research-poc` branch and at the `v1-research-final` tag. The accompanying
+digital garden note is
+[An Experiment in Making Infrastructure Invisible](https://nickdirienzo.com/an-experiment-in-making-infrastructure-invisible/).
