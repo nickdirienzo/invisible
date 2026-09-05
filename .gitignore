@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.invisible/
+.celld/
+.claude/
+.conductor/
+.jj/
+*.log
+.DS_Store

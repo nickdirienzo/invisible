@@ -1,0 +1,17 @@
+version: 1
+
+policies:
+  - id: state-rmw-across-interleaving-yield
+    title: Read-modify-write crosses a cell interleaving boundary
+    severity: error
+    when:
+      deployment:
+        concurrency.interleavesOnExternalAwait: true
+        execution.authority.exclusive: true
+      code:
+        kind: state-rmw-across-yield
+        attributes:
+          atomicity.required: true
+          state.scope: cell
+          yield.kind: external
+    message: A read-modify-write sequence crosses an external await where another request can change the same cell state.

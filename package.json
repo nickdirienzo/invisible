@@ -1,0 +1,32 @@
+{
+  "name": "invisible",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Compile Node.js standard-library programs into one durable celld application cell.",
+  "license": "MIT",
+  "bin": {
+    "ii": "./dist/cli.js",
+    "invisible": "./dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test 'src/**/*.test.ts'",
+    "check": "npm run build && npm test",
+    "compile:example": "node --import tsx src/cli.ts compile examples/counter.ts --out .invisible",
+    "facts:unsafe": "node --import tsx src/cli.ts facts test/fixtures/unsafe-counter.ts --out .invisible/waldo-facts.jsonl"
+  },
+  "dependencies": {
+    "typescript": "5.9.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.1",
+    "tsx": "4.20.5"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

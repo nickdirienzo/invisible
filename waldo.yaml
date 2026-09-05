@@ -1,0 +1,16 @@
+version: 1
+
+deployment:
+  units:
+    app-cell:
+      codeRoots: [test/fixtures]
+      facts:
+        concurrency.interleavesOnExternalAwait: true
+        execution.authority.exclusive: true
+        execution.authority.scope: cell
+        storage.acknowledgedWriteRpo: 0
+
+policyFiles:
+  - waldo/state-rmw-across-interleaving-yield.yaml
+
+dispositions: []
