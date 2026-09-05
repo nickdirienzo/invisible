@@ -76,9 +76,10 @@ The intended source vocabulary is the Node standard library, expanded one
 primitive at a time. Today, unsupported imports and Map representations fail
 compilation instead of silently changing their behavior.
 
-Waldo owns checks whose outcome depends on both source behavior and runtime
-topology. The included unsafe fixture demonstrates a read-modify-write path
-that crosses an external `await`, where celld may interleave another request:
+[Waldo](https://github.com/mirage-security/waldo) owns checks whose outcome
+depends on both source behavior and runtime topology. The included unsafe
+fixture demonstrates a read-modify-write path that crosses an external `await`,
+where celld may interleave another request:
 
 ```sh
 npm run build

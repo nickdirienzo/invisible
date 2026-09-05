@@ -40,7 +40,8 @@ cells would split module-scope state.
 
 ## Static analysis and Waldo
 
-Invisible emits provider-neutral Waldo facts for state read-modify-write paths
+Invisible emits provider-neutral [Waldo](https://github.com/mirage-security/waldo)
+facts for state read-modify-write paths
 that cross an external await. Waldo joins those facts with the celld deployment
 fact `concurrency.interleavesOnExternalAwait: true`.
 

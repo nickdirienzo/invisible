@@ -40,7 +40,9 @@ interleaving point inside one application cell. This is the counter invariant.
 
 An external `await` opens an interleaving boundary. A read-modify-write path
 that crosses one is unsafe unless the application supplies another concurrency
-mechanism. Invisible emits a Waldo fact for the currently recognized form.
+mechanism. Invisible emits a
+[Waldo](https://github.com/mirage-security/waldo) fact for the currently
+recognized form.
 
 ## HTTP surface
 

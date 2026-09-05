@@ -5,7 +5,8 @@ Date: 2026-09-04 (America/Los_Angeles)
 Pinned inputs:
 
 - celld `v0.4.0`; downloaded GitHub release attestation verified successfully.
-- Waldo commit `0f3dc293b2188bf71926ce6f0be85a1a4ae15c1a`.
+- [Waldo](https://github.com/mirage-security/waldo) commit
+  `0f3dc293b2188bf71926ce6f0be85a1a4ae15c1a`.
 - Node.js `v23.11.0` for the request driver.
 
 ## Runtime observation
